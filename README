@@ -1,0 +1,43 @@
+LeRobot Rate Monotonic Data Acquisition
+=======================================
+
+500Hz synchronized IMU + Servo encoder capture for LeRobot datasets.
+
+Hardware
+--------
+- Teensy 4.1
+- ISM330DHCX IMU (SPI1 @ 4MHz)
+- Feetech STS3215 servo (Serial3 @ 1Mbaud)
+- Serial4 @ 2Mbaud for data output
+
+Projects
+--------
+Lerobot_RM_Phase1/    IMU-only @ 500Hz (validated)
+Lerobot_RM_Phase2/    IMU + Servo with Seqlock
+adafruit_ism330dhcx_test/    IMU test sketch
+feetech_servo_timing_test/   Servo timing test
+
+Phase 2 Features
+----------------
+- Writer-Preferred Seqlock (lock-free ISR->main sync)
+- SPI_MODE3 + delayNanoseconds(125) for Teensy 4.x
+- BDU, I2C_disable, DEVICE_CONF per ISM330DHCX datasheet
+- Coherency validation (XOR checksum + torn read detection)
+- Non-blocking debug ring buffer (rate-limited drain)
+
+Usage
+-----
+1. Flash firmware via Arduino IDE
+2. Run Python parser:
+   python3 Lerobot_RM_Phase2/parse_phase2_csv.py /dev/ttyACM0 2000000 -o capture.csv -v
+
+Wiring (SPI1)
+-------------
+CS   -> Pin 0  (10k pull-down to GND required)
+SCK  -> Pin 27
+MOSI -> Pin 26
+MISO -> Pin 1
+VCC  -> 3.3V
+GND  -> GND
+
+
