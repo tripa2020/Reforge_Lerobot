@@ -22,8 +22,6 @@
  *   ⏸ Command queue + servo writes @ 40-100Hz
  *   ⏸ DMA for Serial4 TX (optional, based on validation)
  *
- * Author: Alex + Claude
- * Date: 2025-12-02
  * Phase: 2.0 (Seqlock + Servo Read @ 500Hz)
  */
 

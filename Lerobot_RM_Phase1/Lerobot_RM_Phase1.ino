@@ -9,8 +9,6 @@
  *   - Main loop drains buffer to CSV ring buffer
  *   - CSV logger streams to Serial4 @ 921600 baud
  *
- * Author: Alex + Claude
- * Date: 2025-01-28
  * Phase: 1 (Minimal RM Core - 500Hz IMU Only)
  */
 
