@@ -1,0 +1,39 @@
+# Arduino build artifacts
+*.elf
+*.hex
+*.bin
+*.map
+*.eep
+*.lst
+*.sym
+*.lss
+*.o
+*.d
+
+# Build directories
+build/
+.build/
+
+# IDE settings
+.vscode/
+*.code-workspace
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+
+# Documentation and data files
+*.md
+*.csv
+*.png
+
+# Temporary files
+*.tmp
+*.bak
+*~
