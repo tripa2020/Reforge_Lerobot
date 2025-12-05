@@ -1,28 +1,30 @@
 /*
- * LeRobot Rate Monotonic Data Acquisition - Phase 2.0
+ * LeRobot Rate Monotonic Data Acquisition - Phase 2.1.1
  *
- * Goal: 500Hz perfectly time-synchronized IMU + Servo encoder with Seqlock
+ * Goal: Validate Seqlock foundation with IMU-only @ 500Hz
  *
  * Architecture:
  *   - IntervalTimer @ 500Hz triggers ISR
- *   - ISR reads Servo (Serial3) then IMU (SPI1) with single timestamp
+ *   - ISR reads IMU ONLY (SPI1) - NO SERVO (phased approach)
  *   - Seqlock (Writer-Preferred) for lock-free ISR→main loop synchronization
  *   - Main loop drains Seqlock data to CSV ring buffer
  *   - CSV logger streams to Serial4 @ 2 Mbaud
  *
- * Phase 2.0 Features:
+ * Phase 2.1.1 Features (IMU-ONLY VALIDATION):
  *   ✅ Seqlock (replaces Phase 1 double-buffer)
- *   ✅ Servo encoder reading @ 500Hz (read-only, no writes)
- *   ✅ Perfect time sync (single timestamp for both sensors)
- *   ✅ Skew diagnostics (imu_servo_skew_us)
+ *   ✅ IMU reading @ 500Hz (validate seqlock works)
+ *   ✅ Expected ISR WCET: ~49µs (vs 354µs with servo)
  *   ✅ Coherency validation (checksum + flag for torn read detection)
  *   ✅ Jitter measurement (period_error_us)
+ *   ❌ NO SERVO - deferred to Phase 2.1.2 (background polling)
  *
- * Phase 2.1+ (Deferred):
+ * Phase 2.1.2+ (Deferred):
+ *   ⏸ Background servo polling task (main loop state machine)
+ *   ⏸ Generation counter coherency (user feedback incorporated)
  *   ⏸ Command queue + servo writes @ 40-100Hz
  *   ⏸ DMA for Serial4 TX (optional, based on validation)
  *
- * Phase: 2.0 (Seqlock + Servo Read @ 500Hz)
+ * Phase: 2.1.1 (IMU-Only Seqlock Validation)
  */
 
 #include <Arduino.h>
@@ -31,10 +33,10 @@
 // ARM Cortex-M7 Data Memory Barrier (for Seqlock synchronization)
 #if defined(__arm__) && defined(__IMXRT1062__)
   // Teensy 4.1 (ARM Cortex-M7) - use inline assembly
-  #define __DMB() asm volatile("dmb" ::: "memory")
+  #define SEQLOCK_BARRIER() asm volatile("dmb" ::: "memory")
 #else
   // Fallback for other platforms
-  #define __DMB() __sync_synchronize()
+  #define SEQLOCK_BARRIER() __sync_synchronize()
 #endif
 
 // ============== CONFIGURATION ==============
@@ -42,23 +44,30 @@
 #define SAMPLE_PERIOD_US (1000000UL / SAMPLE_RATE_HZ)  // 2000 µs
 
 #define SERIAL_CSV_BAUD 2000000  // 2 Mbaud (Phase 1 validated)
-#define ENABLE_DEBUG_OUTPUT 1    // 0 = silent, 1 = startup + errors
+#define ENABLE_DEBUG_OUTPUT 0    // 0 = silent, 1 = startup + errors
+
+// ============== TIMING LIMITATIONS ==============
+// KNOWN ISSUE: micros() wraparound every ~71 minutes (2^32 µs)
+// Impact: Time interval calculations (now - start) will fail across wraparound.
+// Affected: servo timeout checks, jitter calculation, debug rate limiting.
+// Mitigation: None implemented. Acceptable for short test runs (<1 hour).
+// TODO (Phase 3): Use wraparound-safe arithmetic if long-duration needed.
 
 // ============== HARDWARE - IMU ==============
-// SPI1 pins (Phase 1 validated with ISM330DHCX)
-#define IMU_CS 0       // SPI1 CS (requires 10kΩ pull-down to GND)
-#define IMU_SCK 27     // SPI1 SCK
-#define IMU_MISO 1     // SPI1 MISO
-#define IMU_MOSI 26    // SPI1 MOSI
+// Default SPI pins (validated with ISM330DHCX MODE0 @ 4MHz)
+#define IMU_CS 10      // Default SPI CS (requires 10kΩ pull-down to GND)
+#define IMU_SCK 13     // Default SPI SCK
+#define IMU_MISO 12    // Default SPI MISO
+#define IMU_MOSI 11    // Default SPI MOSI
 
 Adafruit_ISM330DHCX imu;
 
 // ============== HARDWARE - SERVO ==============
 // Serial3 @ 1 Mbaud (tested in feetech_servo_timing_test)
 #define SERVO_SERIAL Serial3
-#define SERVO_BAUD 1000000       // 1 Mbps (Feetech default)
-#define SERVO_ID 6               // Gripper motor
-#define SERVO_TIMEOUT_MS 10      // Read timeout
+#define SERVO_BAUD 1000000          // 1 Mbps (Feetech default)
+#define SERVO_ID 6                  // Gripper motor
+#define SERVO_TIMEOUT_MICROS 800    // Must be well under 2000us (ISR period)
 
 // Feetech Protocol (STS3215 Communication Manual)
 #define FEETECH_HEADER_1 0xFF
@@ -185,15 +194,6 @@ void csv_service();
 void print_stats();
 void debug_log(const char* msg);
 void debug_service();
-uint8_t imu_read_register(uint8_t reg);
-void imu_write_register(uint8_t reg, uint8_t value);
-void imu_configure_registers();
-
-// ============== ISM330DHCX REGISTER ADDRESSES (DS13012 Rev 7) ==============
-#define ISM330_CTRL3_C   0x12  // Control register 3 (BDU, etc.)
-#define ISM330_CTRL4_C   0x13  // Control register 4 (I2C_disable, etc.)
-#define ISM330_CTRL9_XL  0x18  // Control register 9 (DEVICE_CONF, etc.)
-#define ISM330_WHO_AM_I  0x0F  // Device ID register (should return 0x6B)
 
 // ============== NON-BLOCKING DEBUG FUNCTIONS ==============
 
@@ -238,114 +238,6 @@ void debug_service() {
     }
 }
 
-// ============== ISM330DHCX DIRECT SPI REGISTER ACCESS ==============
-// Required because Adafruit library doesn't expose register write methods publicly
-// Per ISM330DHCX datasheet Section 4.4.1: SPI read = 0x80 | reg, SPI write = reg
-
-uint8_t imu_read_register(uint8_t reg) {
-    uint8_t value;
-    // ISM330DHCX requires SPI Mode 3: CPOL=1 (clock idles HIGH), CPHA=1
-    // Reference: Reddit embedded forum, Invensense IMU library patterns
-    SPI1.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE3));
-    digitalWriteFast(IMU_CS, LOW);  // Use digitalWriteFast on Teensy
-    #if defined(__IMXRT1062__)
-    delayNanoseconds(125);  // CRITICAL: Teensy 4.x is too fast, slave needs setup time
-    #endif
-    SPI1.transfer(reg | 0x80);  // Read operation: MSB = 1
-    value = SPI1.transfer(0x00);
-    digitalWriteFast(IMU_CS, HIGH);
-    #if defined(__IMXRT1062__)
-    delayNanoseconds(125);  // Hold time before next transaction
-    #endif
-    SPI1.endTransaction();
-    return value;
-}
-
-void imu_write_register(uint8_t reg, uint8_t value) {
-    // ISM330DHCX requires SPI Mode 3: CPOL=1 (clock idles HIGH), CPHA=1
-    SPI1.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE3));
-    digitalWriteFast(IMU_CS, LOW);
-    #if defined(__IMXRT1062__)
-    delayNanoseconds(125);  // CRITICAL: Teensy 4.x setup time
-    #endif
-    SPI1.transfer(reg & 0x7F);  // Write operation: MSB = 0
-    SPI1.transfer(value);
-    digitalWriteFast(IMU_CS, HIGH);
-    #if defined(__IMXRT1062__)
-    delayNanoseconds(125);  // Hold time
-    #endif
-    SPI1.endTransaction();
-}
-
-// Configure ISM330DHCX registers per datasheet DS13012 Rev 7 Section 7.3/9
-// MUST be called AFTER imu.begin_SPI() but BEFORE setting ODR
-void imu_configure_registers() {
-    #if ENABLE_DEBUG_OUTPUT
-    Serial.println("\n=== ISM330DHCX REGISTER CONFIGURATION ===");
-    #endif
-
-    // Verify WHO_AM_I (0x6B for ISM330DHCX)
-    uint8_t who_am_i = imu_read_register(ISM330_WHO_AM_I);
-    #if ENABLE_DEBUG_OUTPUT
-    Serial.print("WHO_AM_I: 0x"); Serial.print(who_am_i, HEX);
-    Serial.println(who_am_i == 0x6B ? " [OK]" : " [UNEXPECTED]");
-    #endif
-
-    // 1. Enable BDU (Block Data Update) - CTRL3_C bit 6
-    //    Prevents reading MSB of sample N and LSB of sample N+1 (internal torn read)
-    //    Datasheet [cite: 1289]: "output registers not updated until MSB and LSB read"
-    uint8_t ctrl3 = imu_read_register(ISM330_CTRL3_C);
-    ctrl3 |= (1 << 6);  // Set BDU bit
-    imu_write_register(ISM330_CTRL3_C, ctrl3);
-    #if ENABLE_DEBUG_OUTPUT
-    Serial.print("CTRL3_C: 0x"); Serial.print(ctrl3, HEX);
-    Serial.println(" (BDU=1)");
-    #endif
-
-    // 2. Disable I2C interface - CTRL4_C bit 2
-    //    Prevents I2C block from misinterpreting SPI noise as I2C start condition
-    //    Datasheet [cite: 1074, 422]: "I2C_disable = 1 in CTRL4_C"
-    uint8_t ctrl4 = imu_read_register(ISM330_CTRL4_C);
-    ctrl4 |= (1 << 2);  // Set I2C_disable bit
-    imu_write_register(ISM330_CTRL4_C, ctrl4);
-    #if ENABLE_DEBUG_OUTPUT
-    Serial.print("CTRL4_C: 0x"); Serial.print(ctrl4, HEX);
-    Serial.println(" (I2C_disable=1)");
-    #endif
-
-    // 3. Set DEVICE_CONF - CTRL9_XL bit 1
-    //    Datasheet [cite: 1074, 1455]: "recommended to always set this bit to 1"
-    uint8_t ctrl9 = imu_read_register(ISM330_CTRL9_XL);
-    ctrl9 |= (1 << 1);  // Set DEVICE_CONF bit
-    imu_write_register(ISM330_CTRL9_XL, ctrl9);
-    #if ENABLE_DEBUG_OUTPUT
-    Serial.print("CTRL9_XL: 0x"); Serial.print(ctrl9, HEX);
-    Serial.println(" (DEVICE_CONF=1)");
-    #endif
-
-    // Verify all writes
-    #if ENABLE_DEBUG_OUTPUT
-    Serial.println("--- Verification ---");
-    uint8_t v_ctrl3 = imu_read_register(ISM330_CTRL3_C);
-    uint8_t v_ctrl4 = imu_read_register(ISM330_CTRL4_C);
-    uint8_t v_ctrl9 = imu_read_register(ISM330_CTRL9_XL);
-
-    bool bdu_ok = (v_ctrl3 & (1 << 6)) != 0;
-    bool i2c_ok = (v_ctrl4 & (1 << 2)) != 0;
-    bool dev_ok = (v_ctrl9 & (1 << 1)) != 0;
-
-    Serial.print("BDU: "); Serial.println(bdu_ok ? "ENABLED" : "FAILED");
-    Serial.print("I2C_disable: "); Serial.println(i2c_ok ? "ENABLED" : "FAILED");
-    Serial.print("DEVICE_CONF: "); Serial.println(dev_ok ? "ENABLED" : "FAILED");
-
-    if (bdu_ok && i2c_ok && dev_ok) {
-        Serial.println("=== ALL REGISTERS CONFIGURED ===");
-    } else {
-        Serial.println("[WARN] Some registers failed to configure!");
-    }
-    #endif
-}
-
 // ============== FEETECH PROTOCOL FUNCTIONS ==============
 
 uint8_t calculate_checksum(uint8_t* data, uint8_t len) {
@@ -383,12 +275,17 @@ int32_t read_servo_position(uint8_t servo_id, uint32_t* duration_us, uint8_t* er
     // Send request and measure time
     uint32_t start_us = micros();
     SERVO_SERIAL.write(request, 8);
-    SERVO_SERIAL.flush();
+    // NOTE: No flush() - it's blocking (~200µs). TX buffer drains in background.
+    // At 1Mbaud, 8 bytes = 80µs transmission time (acceptable latency).
 
-    // Wait for 8-byte response
-    uint32_t timeout_start = millis();
+    // Wait for 8-byte response with microsecond precision timeout
+    // ASSUMPTION: This function ONLY supports the fixed 8-byte STS/SCS READ_DATA
+    // position frame (read 2 bytes from REG_PRESENT_POSITION_L). The Feetech
+    // protocol allows variable-length responses, but this code hardcodes rx_count < 8.
+    // If you add other servo commands later, this assumption will break.
+    uint32_t timeout_start = micros();
     while (SERVO_SERIAL.available() < 8) {
-        if (millis() - timeout_start > SERVO_TIMEOUT_MS) {
+        if (micros() - timeout_start > SERVO_TIMEOUT_MICROS) {
             *duration_us = micros() - start_us;
             *error_code = 1;  // Timeout
             stats.servo_timeouts++;
@@ -438,13 +335,13 @@ int32_t read_servo_position(uint8_t servo_id, uint32_t* duration_us, uint8_t* er
 
 SensorData seqlock_read() {
     SensorData snapshot;
-    uint32_t s1, s2;
+    uint32_t s1, s2 = 0;  // Initialize s2 to suppress compiler warning
     uint8_t retries = 0;
     const uint8_t MAX_RETRIES = 5;  // Writer-preferred: give up after 5 retries
 
     do {
         s1 = shared.seq;
-        __DMB();  // ARM Data Memory Barrier (ensure seq read completes before data reads)
+        SEQLOCK_BARRIER();  // ARM Data Memory Barrier (ensure seq read completes before data reads)
 
         // Check if writer is active (seq is odd)
         if (s1 & 1) {
@@ -463,19 +360,17 @@ SensorData seqlock_read() {
         // Copy data (fast memcpy, ~50ns for 64 bytes on Cortex-M7)
         snapshot = shared.data;
 
-        __DMB();  // Ensure data reads complete before seq read
+        SEQLOCK_BARRIER();  // Ensure data reads complete before seq read
         s2 = shared.seq;
 
         retries++;
 
     } while (s1 != s2 && retries < MAX_RETRIES);
 
-    // Verify coherency with checksum
+    // Verify coherency with checksum (Phase 2.1.1: no servo in checksum)
     uint32_t accel_bits;
     memcpy(&accel_bits, &snapshot.accel_x_mps2, sizeof(uint32_t));
-    uint32_t expected_checksum = snapshot.timestamp_us ^ snapshot.generation
-                                 ^ accel_bits
-                                 ^ (uint32_t)snapshot.servo_position;
+    uint32_t expected_checksum = snapshot.timestamp_us ^ snapshot.generation ^ accel_bits;
 
     if (snapshot.checksum != expected_checksum || snapshot.coherency_flag != 0xAA) {
         stats.torn_reads++;
@@ -508,34 +403,28 @@ void sensorReadTimer_ISR() {
     isr_active = true;
 
     uint32_t isr_start = micros();
-    uint32_t expected_time = last_isr_time_us + SAMPLE_PERIOD_US;  // 2000 µs
+    uint32_t expected_time = last_isr_time_us + SAMPLE_PERIOD_US;  // 2000 µsT
 
     // ===== SEQLOCK WRITE SEQUENCE =====
 
     // 1. Lock (increment seq to odd)
     shared.seq++;
-    __DMB();  // Ensure seq write completes before data writes
+    SEQLOCK_BARRIER();  // Ensure seq write completes before data writes
 
-    // 2. Capture timestamp FIRST (shared by both sensors)
+    // 2. Capture timestamp FIRST
     uint32_t timestamp = micros();
     shared.data.timestamp_us = timestamp;
     shared.data.generation = sample_generation++;
 
-    // 3. Read servo encoder (Serial3)
-    uint32_t servo_start = micros();
-    uint8_t servo_error = 0;
-    uint32_t servo_duration = 0;
-    int32_t servo_pos = read_servo_position(SERVO_ID, &servo_duration, &servo_error);
+    // 3. **PHASE 2.1.1: NO SERVO - IMU ONLY**
+    // Servo reading deferred to Phase 2.1.2 (background polling task)
+    // This validates seqlock foundation without servo complexity
+    shared.data.servo_position = -1;      // Invalid (no servo)
+    shared.data.servo_read_us = 0;        // Not measured
+    shared.data.servo_error_code = 0xFF;  // Not available
+    shared.data.servo_velocity = 0;
 
-    shared.data.servo_position = (servo_pos >= 0) ? servo_pos : -1;
-    shared.data.servo_read_us = servo_duration;
-    shared.data.servo_error_code = servo_error;
-
-    if (servo_error != 0) {
-        stats.servo_errors++;
-    }
-
-    // 4. Read IMU (SPI1 @ 4MHz)
+    // 4. Read IMU (SPI1 @ 4MHz) - ONLY sensor read in Phase 2.1.1
     uint32_t imu_start = micros();
     sensors_event_t accel, gyro, temp;
     imu.getEvent(&accel, &gyro, &temp);
@@ -552,22 +441,20 @@ void sensorReadTimer_ISR() {
     // 5. Timing diagnostics
     uint32_t isr_end = micros();
     shared.data.isr_total_us = isr_end - isr_start;
+    // NOTE: Jitter calculation vulnerable to micros() wraparound (see TIMING LIMITATIONS).
+    // Will produce incorrect result if wraparound occurs between samples (~71 min uptime).
     shared.data.period_error_us = (int16_t)(isr_start - expected_time);  // Signed jitter
-    shared.data.imu_servo_skew_us = imu_start - servo_start;  // Should be ~servo_duration µs
-
-    // Placeholder for future expansion
-    shared.data.servo_velocity = 0;
+    shared.data.imu_servo_skew_us = 0;  // N/A for Phase 2.1.1 (IMU-only)
 
     // 6. Coherency checksum (simple XOR of key fields)
+    // Note: servo_pos excluded since not read in Phase 2.1.1
     uint32_t accel_x_bits;
     memcpy(&accel_x_bits, &accel.acceleration.x, sizeof(uint32_t));
-    shared.data.checksum = timestamp ^ sample_generation
-                           ^ accel_x_bits
-                           ^ (uint32_t)servo_pos;
+    shared.data.checksum = timestamp ^ sample_generation ^ accel_x_bits;
     shared.data.coherency_flag = 0xAA;  // Valid marker
 
     // 7. Unlock (increment seq to even)
-    __DMB();  // Ensure all data writes complete before seq write
+    SEQLOCK_BARRIER();  // Ensure all data writes complete before seq write
     shared.seq++;
 
     // ===== END SEQLOCK WRITE =====
@@ -648,7 +535,7 @@ void print_stats() {
 
     float buffer_pct = (buffer_used * 100.0) / CSV_BUFFER_SIZE;
 
-    Serial.println("========== PHASE 2.0 STATS ==========");
+    Serial.println("========== PHASE 2.1.1 STATS ==========");
     Serial.print("Samples: "); Serial.println(stats.isr_count);
     Serial.print("Drops: "); Serial.println(csv_drops);
     Serial.print("Overruns: "); Serial.println(stats.isr_overrun);
@@ -687,9 +574,10 @@ void setup() {
     #if ENABLE_DEBUG_OUTPUT
     delay(1000);
     Serial.println("\n========================================");
-    Serial.println("LeRobot RM Data Acquisition - Phase 2.0");
+    Serial.println("LeRobot RM Data Acquisition - Phase 2.1.1");
     Serial.println("========================================");
-    Serial.println("Features: Seqlock + Servo @ 500Hz");
+    Serial.println("Features: Seqlock + IMU-ONLY @ 500Hz");
+    Serial.println("Goal: Validate seqlock foundation");
     #endif
 
     // CSV output serial
@@ -703,6 +591,66 @@ void setup() {
     #if ENABLE_DEBUG_OUTPUT
     Serial.print("Serial3 (Servo): "); Serial.print(SERVO_BAUD); Serial.println(" baud");
     Serial.print("Servo ID: "); Serial.println(SERVO_ID);
+    #endif
+
+    // ============== INITIALIZE IMU ==============
+    #if ENABLE_DEBUG_OUTPUT
+    Serial.println("\n=== IMU INITIALIZATION ===");
+    #endif
+
+    // CS pin setup (matches working Adafruit example)
+    pinMode(IMU_CS, OUTPUT);
+    digitalWrite(IMU_CS, HIGH);
+
+    // Initialize IMU on default SPI
+    if (!imu.begin_SPI(IMU_CS)) {
+        #if ENABLE_DEBUG_OUTPUT
+        Serial.println("[FATAL] Failed to find ISM330DHCX chip");
+        Serial.println("Check: Breadboard connections, CS (pin 10), SPI wiring");
+        #endif
+        while(1) {
+            digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+            delay(500);
+        }
+    }
+
+    #if ENABLE_DEBUG_OUTPUT
+    Serial.println("ISM330DHCX Found!");
+    #endif
+
+    // Configure interrupt pins (from working example)
+    imu.configInt1(false, false, true);   // accelerometer DRDY on INT1
+    imu.configInt2(false, true, false);   // gyro DRDY on INT2
+
+    // Note: Adafruit library handles BDU, I2C_disable, DEVICE_CONF internally
+    // Manual register config disabled (was using SPI1 instead of default SPI)
+
+    // Set data rates
+    imu.setAccelDataRate(LSM6DS_RATE_833_HZ);
+    imu.setGyroDataRate(LSM6DS_RATE_833_HZ);
+
+    #if ENABLE_DEBUG_OUTPUT
+    Serial.print("Accelerometer range set to: +-");
+    switch(imu.getAccelRange()) {
+        case LSM6DS_ACCEL_RANGE_2_G: Serial.println("2G"); break;
+        case LSM6DS_ACCEL_RANGE_4_G: Serial.println("4G"); break;
+        case LSM6DS_ACCEL_RANGE_8_G: Serial.println("8G"); break;
+        case LSM6DS_ACCEL_RANGE_16_G: Serial.println("16G"); break;
+    }
+
+    Serial.print("Gyro range set to: ");
+    switch(imu.getGyroRange()) {
+        case LSM6DS_GYRO_RANGE_125_DPS: Serial.println("125 degrees/s"); break;
+        case LSM6DS_GYRO_RANGE_250_DPS: Serial.println("250 degrees/s"); break;
+        case LSM6DS_GYRO_RANGE_500_DPS: Serial.println("500 degrees/s"); break;
+        case LSM6DS_GYRO_RANGE_1000_DPS: Serial.println("1000 degrees/s"); break;
+        case LSM6DS_GYRO_RANGE_2000_DPS: Serial.println("2000 degrees/s"); break;
+        case ISM330DHCX_GYRO_RANGE_4000_DPS: Serial.println("4000 degrees/s"); break;
+    }
+
+    Serial.println("Accelerometer data rate set to: 833 Hz");
+    Serial.println("Gyro data rate set to: 833 Hz");
+    Serial.println("=== IMU READY ===");
     #endif
 
     // ============== HANDSHAKE PROTOCOL ==============
@@ -751,61 +699,6 @@ void setup() {
 
     delay(100);  // Brief pause for Python to process ACK
 
-    // ============== INITIALIZE IMU (SPI1) ==============
-    // Per ISM330DHCX datasheet DS13012 Rev 7, Section 7.3 and 9
-
-    // CS pin setup: 10kΩ pull-down resistor ensures SPI mode at power-up
-    // Datasheet [cite: 409]: "To select/exploit the I2C interface, CS must be tied high"
-    // Our pull-down ensures CS is LOW during power-up -> SPI mode selected
-    pinMode(IMU_CS, OUTPUT);
-    digitalWrite(IMU_CS, HIGH);  // Idle high for SPI transactions
-
-    #if ENABLE_DEBUG_OUTPUT
-    Serial.println("SPI1: 4 MHz (pins 0/27/26/1)");
-    #endif
-
-    // Initialize IMU on SPI1 @ 4MHz
-    if (!imu.begin_SPI(IMU_CS, &SPI1, 0, 4000000)) {
-        #if ENABLE_DEBUG_OUTPUT
-        Serial.println("[FATAL] ISM330DHCX not found!");
-        Serial.println("Check: 10kΩ pull-down on CS, SPI1 wiring, power cycle sensor");
-        #endif
-        while(1) {
-            digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-            delay(500);
-        }
-    }
-
-    // === CRITICAL: Configure registers per datasheet BEFORE high-rate sampling ===
-    // This configures BDU, I2C_disable, and DEVICE_CONF as mandated by datasheet
-    imu_configure_registers();
-
-    // Configure IMU for 833Hz ODR (same as Phase 1)
-    // BDU is now set, so output registers won't update mid-read
-    imu.setAccelDataRate(LSM6DS_RATE_833_HZ);
-    imu.setGyroDataRate(LSM6DS_RATE_833_HZ);
-
-    #if ENABLE_DEBUG_OUTPUT
-    Serial.println("IMU: ISM330DHCX @ 833Hz");
-    Serial.print("Accel Range: ±");
-    switch(imu.getAccelRange()) {
-        case LSM6DS_ACCEL_RANGE_2_G: Serial.println("2G"); break;
-        case LSM6DS_ACCEL_RANGE_4_G: Serial.println("4G"); break;
-        case LSM6DS_ACCEL_RANGE_8_G: Serial.println("8G"); break;
-        case LSM6DS_ACCEL_RANGE_16_G: Serial.println("16G"); break;
-    }
-
-    Serial.print("Gyro Range: ");
-    switch(imu.getGyroRange()) {
-        case LSM6DS_GYRO_RANGE_125_DPS: Serial.println("125 DPS"); break;
-        case LSM6DS_GYRO_RANGE_250_DPS: Serial.println("250 DPS"); break;
-        case LSM6DS_GYRO_RANGE_500_DPS: Serial.println("500 DPS"); break;
-        case LSM6DS_GYRO_RANGE_1000_DPS: Serial.println("1000 DPS"); break;
-        case LSM6DS_GYRO_RANGE_2000_DPS: Serial.println("2000 DPS"); break;
-        case ISM330DHCX_GYRO_RANGE_4000_DPS: Serial.println("4000 DPS"); break;
-    }
-    #endif
-
     // ============== TEST SERVO COMMUNICATION ==============
     #if ENABLE_DEBUG_OUTPUT
     Serial.println("\n=== TESTING SERVO ===");
@@ -848,12 +741,12 @@ void setup() {
     Serial.println("*** LOGGING ACTIVE ***");
     Serial.println("Press 's' for stats.");
     Serial.println("CSV output on Serial4 (binary format)");
-    Serial.println("\nPhase 2.0 Validation Criteria:");
-    Serial.println("  [ ] ISR WCET < 400 us");
+    Serial.println("\nPhase 2.1.1 Validation Criteria (IMU-ONLY):");
+    Serial.println("  [ ] Data rate: 500 Hz stable (not 0.1 Hz!)");
+    Serial.println("  [ ] ISR WCET < 100 us (expect ~49us)");
     Serial.println("  [ ] Zero torn reads (coherency_flag == 0xAA)");
-    Serial.println("  [ ] Skew std dev < 5 us");
     Serial.println("  [ ] Period jitter < 100 us");
-    Serial.println("  [ ] Servo error rate < 3%");
+    Serial.println("  [ ] Generation counter gaps = 0");
     #endif
 }
 
@@ -863,7 +756,15 @@ void loop() {
     // ===== PRIORITY 1: Telemetry (Real Data) =====
     // Read sensor data from Seqlock (Writer-Preferred)
     SensorData snapshot = seqlock_read();
-    csv_push_sample(snapshot);
+
+    // CRITICAL: Only push NEW samples (deduplicate by generation counter)
+    // Main loop runs much faster than 500Hz ISR, so we'd get duplicates otherwise
+    // This mirrors Phase 1's newData flag approach using generation counter
+    static uint32_t last_generation = UINT32_MAX;  // Will never match first sample (gen=0)
+    if (snapshot.generation != last_generation) {
+        csv_push_sample(snapshot);
+        last_generation = snapshot.generation;
+    }
 
     // Drain CSV buffer to Serial4 (Phase 1 polling, DMA deferred to Phase 2.3)
     csv_service();

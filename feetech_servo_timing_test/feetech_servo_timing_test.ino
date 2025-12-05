@@ -43,8 +43,12 @@
 #define INSTR_SYNC_WRITE 0x83
 
 // Registers (STS3215 specific - check your servo manual)
+#define REG_MODE 0x21              // Mode register (servo/motor/step mode)
+#define REG_ALARM_SHUTDOWN 0x24    // Alarm shutdown conditions
+#define REG_TORQUE_ENABLE 0x28     // Torque enable (0=off, 1=on)
 #define REG_GOAL_POSITION_L 0x2A  // Goal position low byte
 #define REG_GOAL_POSITION_H 0x2B  // Goal position high byte
+#define REG_LOCK 0x37              // EEPROM lock (1=locked, prevents writes)
 #define REG_PRESENT_POSITION_L 0x38  // Current position low byte
 #define REG_PRESENT_POSITION_H 0x39  // Current position high byte
 
@@ -205,7 +209,7 @@ void run_timing_test() {
 
     // Test position values (oscillate between two positions)
     uint16_t pos_a = 2048;  // Center position
-    uint16_t pos_b = 3500;  // +500 units from center
+    uint16_t pos_b = 4000;  // +500 units from center
 
     Serial.println("Running test...");
     uint32_t test_start = millis();
