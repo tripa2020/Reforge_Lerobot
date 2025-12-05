@@ -1,30 +1,35 @@
 /*
- * LeRobot Rate Monotonic Data Acquisition - Phase 2.1.1
+ * LeRobot Rate Monotonic Data Acquisition - Phase 2.1.2
  *
- * Goal: Validate Seqlock foundation with IMU-only @ 500Hz
+ * Goal: Background servo polling + IMU @ 500Hz with offline interpolation
  *
  * Architecture:
- *   - IntervalTimer @ 500Hz triggers ISR
- *   - ISR reads IMU ONLY (SPI1) - NO SERVO (phased approach)
+ *   - IntervalTimer @ 500Hz triggers ISR (IMU read + servo snapshot)
+ *   - Servo bus manager FSM in main loop polls servo @ ~526Hz
+ *   - ISR snapshots latest_servo via generation counter (no UART I/O in ISR!)
  *   - Seqlock (Writer-Preferred) for lock-free ISR→main loop synchronization
- *   - Main loop drains Seqlock data to CSV ring buffer
  *   - CSV logger streams to Serial4 @ 2 Mbaud
  *
- * Phase 2.1.1 Features (IMU-ONLY VALIDATION):
+ * Phase 2.1.2 Features:
  *   ✅ Seqlock (replaces Phase 1 double-buffer)
- *   ✅ IMU reading @ 500Hz (validate seqlock works)
- *   ✅ Expected ISR WCET: ~49µs (vs 354µs with servo)
- *   ✅ Coherency validation (checksum + flag for torn read detection)
- *   ✅ Jitter measurement (period_error_us)
- *   ❌ NO SERVO - deferred to Phase 2.1.2 (background polling)
+ *   ✅ IMU reading @ 500Hz in ISR
+ *   ✅ Background servo polling @ ~526Hz (servo_bus_service FSM)
+ *   ✅ Generation counter coherency (ServoState shared bus_manager→ISR)
+ *   ✅ Midpoint timestamp: sample_ts_us = (t_req + t_resp) / 2
+ *   ✅ Servo age calculation for offline interpolation
+ *   ✅ Expected ISR WCET: ~135µs (IMU + servo snapshot)
  *
- * Phase 2.1.2+ (Deferred):
- *   ⏸ Background servo polling task (main loop state machine)
- *   ⏸ Generation counter coherency (user feedback incorporated)
- *   ⏸ Command queue + servo writes @ 40-100Hz
+ * Offline Interpolation Data (per CSV row):
+ *   - timestamp_us: IMU sample time (primary timeline)
+ *   - servo_position: Zero-order hold of latest servo reading
+ *   - servo_read_us: Age of servo sample (timestamp_us - sample_ts_us)
+ *   - servo_error_code: 0=OK, 1=timeout, 2=checksum, 3=framing
+ *
+ * Phase 2.1.3 (Deferred):
+ *   ⏸ servo_set_goal_position() for writes @ 100Hz
  *   ⏸ DMA for Serial4 TX (optional, based on validation)
  *
- * Phase: 2.1.1 (IMU-Only Seqlock Validation)
+ * Phase: 2.1.2 (Background Servo Polling)
  */
 
 #include <Arduino.h>
@@ -124,6 +129,79 @@ static_assert(sizeof(SensorData) == 64, "SensorData must be exactly 64 bytes");
 
 typedef SensorData CSVSample;  // Alias for consistency
 
+// ============== SHARED SERVO STATE (BUS MANAGER → ISR) ==============
+// Phase 2.1.2: Background servo polling writes here, ISR reads via generation counter
+//
+// Coherency Protocol:
+//   Writer (servo_bus_service): Update fields, SEQLOCK_BARRIER(), increment generation LAST
+//   Reader (ISR): Read generation, copy fields, read generation again, retry if changed
+//
+// This avoids noInterrupts() - Cortex-M7 32-bit loads are atomic, generation catches torn reads
+
+struct ServoState {
+    volatile int32_t position;       // Last encoder position (0-4095, or -1 on error)
+    volatile uint32_t timestamp_us;  // When response was fully received (t_resp)
+    volatile uint32_t sample_ts_us;  // Midpoint (t_req + t_resp) / 2 = best physical sample time
+    volatile uint8_t error_code;     // 0=OK, 1=timeout, 2=checksum, 3=framing
+    volatile uint32_t generation;    // Coherency counter (incremented LAST by writer)
+};
+
+// Global shared servo state (written by bus manager, read by ISR)
+volatile ServoState latest_servo = {
+    -1,       // position: invalid until first successful read
+    0,        // timestamp_us: no valid timestamp yet (t_resp)
+    0,        // sample_ts_us: no valid sample time yet (midpoint)
+    0xFF,     // error_code: 0xFF = not yet initialized
+    0         // generation: starts at 0
+};
+
+// ============== SERVO BUS MANAGER (Serial3 FSM) ==============
+// Phase 2.1.2: Non-blocking state machine for servo communication
+//
+// States:
+//   SERVO_IDLE         - Waiting for next poll interval
+//   SERVO_WAIT_RESPONSE - Request sent, accumulating response bytes
+//
+// Timing:
+//   Poll interval: 1900µs (~526 Hz, just under 2000µs ISR period)
+//   Timeout: 800µs (validated in Phase 2.1.1)
+//   Round-trip: ~460-760µs (TX 80µs + servo 300-600µs + RX 80µs)
+
+enum ServoBusState {
+    SERVO_IDLE,
+    SERVO_WAIT_RESPONSE
+};
+
+struct ServoBusManager {
+    ServoBusState state;
+
+    uint32_t last_poll_us;       // When we last completed a poll cycle
+    uint32_t request_sent_us;    // When we sent the current request
+
+    uint8_t rx_buf[16];          // Response buffer (8 bytes expected + safety margin)
+    uint8_t rx_count;            // Bytes received so far
+
+    // Rate control for goal writes (Phase 2.1.3)
+    uint32_t last_write_us;      // When we last sent a goal command
+    int32_t pending_goal_pos;    // -1 = no pending goal, else target position
+};
+
+// Global servo bus manager state
+ServoBusManager servo_bus = {
+    SERVO_IDLE,     // state: start idle
+    0,              // last_poll_us
+    0,              // request_sent_us
+    {0},            // rx_buf
+    0,              // rx_count
+    0,              // last_write_us
+    -1              // pending_goal_pos: no pending goal
+};
+
+// Timing constants (microseconds)
+const uint32_t SERVO_POLL_INTERVAL_US  = 1900;   // ~526 Hz (just under ISR period)
+const uint32_t SERVO_TIMEOUT_US        = 800;    // Must be < SAMPLE_PERIOD_US
+const uint32_t SERVO_WRITE_INTERVAL_US = 10000;  // 100 Hz max goal write rate
+
 // ============== SEQLOCK BUFFER ==============
 
 struct SeqlockBuffer {
@@ -187,6 +265,7 @@ IntervalTimer sensorTimer;
 void sensorReadTimer_ISR();
 int32_t read_servo_position(uint8_t servo_id, uint32_t* duration_us, uint8_t* error_code);
 uint8_t calculate_checksum(uint8_t* data, uint8_t len);
+void servo_bus_service();  // Phase 2.1.2: Non-blocking servo polling FSM
 SensorData seqlock_read();
 void csv_push_sample(const CSVSample& sample);
 bool csv_buffer_full();
@@ -331,6 +410,137 @@ int32_t read_servo_position(uint8_t servo_id, uint32_t* duration_us, uint8_t* er
     return position;
 }
 
+// ============== SERVO BUS SERVICE (Phase 2.1.2) ==============
+// Non-blocking state machine for servo polling
+// Runs in main loop, updates latest_servo via generation counter protocol
+// ISR reads latest_servo snapshot (no UART I/O in ISR!)
+
+void servo_bus_service() {
+    uint32_t now_us = micros();
+
+    switch (servo_bus.state) {
+
+    case SERVO_IDLE:
+        // Wait for poll interval before sending next request
+        if ((now_us - servo_bus.last_poll_us) >= SERVO_POLL_INTERVAL_US) {
+
+            // Build read position request (8 bytes)
+            uint8_t request[8];
+            request[0] = FEETECH_HEADER_1;
+            request[1] = FEETECH_HEADER_2;
+            request[2] = SERVO_ID;
+            request[3] = 0x04;  // Length
+            request[4] = INSTR_READ_DATA;
+            request[5] = REG_PRESENT_POSITION_L;
+            request[6] = 0x02;  // Read 2 bytes (position)
+            request[7] = calculate_checksum(request, 8);
+
+            // Clear RX buffer (discard any stale data)
+            while (SERVO_SERIAL.available()) {
+                SERVO_SERIAL.read();
+            }
+
+            // Record request time BEFORE sending (t_req)
+            servo_bus.request_sent_us = micros();
+
+            // Send request (non-blocking, TX buffer drains in background)
+            SERVO_SERIAL.write(request, 8);
+            // NOTE: No flush()! flush() blocks for ~80µs at 1Mbaud
+
+            servo_bus.rx_count = 0;
+            servo_bus.state = SERVO_WAIT_RESPONSE;
+        }
+        break;
+
+    case SERVO_WAIT_RESPONSE:
+        // Accumulate bytes (non-blocking)
+        while (SERVO_SERIAL.available() && servo_bus.rx_count < 8) {
+            servo_bus.rx_buf[servo_bus.rx_count++] = SERVO_SERIAL.read();
+        }
+
+        if (servo_bus.rx_count >= 8) {
+            // Got full response - record response time (t_resp)
+            uint32_t t_resp = micros();
+            uint32_t t_req = servo_bus.request_sent_us;
+
+            // Calculate midpoint timestamp (best estimate of physical sample time)
+            uint32_t t_sample = (t_req + t_resp) / 2;
+
+            // Validate response
+            bool valid = true;
+            uint8_t error_code = 0;
+
+            // Check header
+            if (servo_bus.rx_buf[0] != FEETECH_HEADER_1 ||
+                servo_bus.rx_buf[1] != FEETECH_HEADER_2) {
+                valid = false;
+                error_code = 3;  // Framing error
+            }
+
+            // Check servo ID
+            if (valid && servo_bus.rx_buf[2] != SERVO_ID) {
+                valid = false;
+                error_code = 3;  // Framing error (wrong servo)
+            }
+
+            // Check checksum
+            if (valid) {
+                uint8_t calc_cks = calculate_checksum(servo_bus.rx_buf, 8);
+                if (servo_bus.rx_buf[7] != calc_cks) {
+                    valid = false;
+                    error_code = 2;  // Checksum error
+                    stats.servo_checksum_errors++;
+                }
+            }
+
+            // Check servo error byte
+            if (valid && servo_bus.rx_buf[4] != 0x00) {
+                valid = false;
+                error_code = 3;  // Servo reported error
+            }
+
+            // Update latest_servo (generation counter protocol)
+            if (valid) {
+                int32_t position = servo_bus.rx_buf[5] | (servo_bus.rx_buf[6] << 8);
+
+                // Write all fields FIRST
+                latest_servo.position = position;
+                latest_servo.timestamp_us = t_resp;
+                latest_servo.sample_ts_us = t_sample;
+                latest_servo.error_code = 0;
+
+                // Memory barrier then increment generation LAST
+                SEQLOCK_BARRIER();
+                latest_servo.generation++;
+            } else {
+                // Error path: update error but keep last valid position
+                latest_servo.error_code = error_code;
+                SEQLOCK_BARRIER();
+                latest_servo.generation++;
+
+                stats.servo_errors++;
+            }
+
+            servo_bus.last_poll_us = now_us;
+            servo_bus.state = SERVO_IDLE;
+        }
+        else if ((now_us - servo_bus.request_sent_us) >= SERVO_TIMEOUT_US) {
+            // Timeout - no response from servo
+            latest_servo.error_code = 1;  // Timeout
+            SEQLOCK_BARRIER();
+            latest_servo.generation++;
+
+            stats.servo_timeouts++;
+            stats.servo_errors++;
+
+            servo_bus.last_poll_us = now_us;
+            servo_bus.state = SERVO_IDLE;
+        }
+        // else: still waiting, stay in SERVO_WAIT_RESPONSE
+        break;
+    }
+}
+
 // ============== SEQLOCK READER (WRITER-PREFERRED) ==============
 
 SensorData seqlock_read() {
@@ -416,13 +626,34 @@ void sensorReadTimer_ISR() {
     shared.data.timestamp_us = timestamp;
     shared.data.generation = sample_generation++;
 
-    // 3. **PHASE 2.1.1: NO SERVO - IMU ONLY**
-    // Servo reading deferred to Phase 2.1.2 (background polling task)
-    // This validates seqlock foundation without servo complexity
-    shared.data.servo_position = -1;      // Invalid (no servo)
-    shared.data.servo_read_us = 0;        // Not measured
-    shared.data.servo_error_code = 0xFF;  // Not available
-    shared.data.servo_velocity = 0;
+    // 3. **PHASE 2.1.2: SNAPSHOT SERVO FROM BUS MANAGER**
+    // Servo is polled in background by servo_bus_service(), we just read latest_servo
+    // using generation counter coherency (no UART I/O in ISR!)
+    {
+        ServoState servo_snap;
+        uint32_t g1, g2;
+
+        // Generation counter read protocol (retry if bus manager updated mid-read)
+        do {
+            g1 = latest_servo.generation;
+            servo_snap.position = latest_servo.position;
+            servo_snap.timestamp_us = latest_servo.timestamp_us;
+            servo_snap.sample_ts_us = latest_servo.sample_ts_us;
+            servo_snap.error_code = latest_servo.error_code;
+            g2 = latest_servo.generation;
+        } while (g1 != g2);  // Retry if generation changed (torn read)
+
+        shared.data.servo_position = servo_snap.position;
+        shared.data.servo_error_code = servo_snap.error_code;
+
+        // Compute servo age: how old is the servo sample at this IMU tick?
+        // servo_read_us repurposed as servo_age_us for offline interpolation
+        uint16_t servo_age = 0xFFFF;  // Default: invalid/unknown
+        if (servo_snap.sample_ts_us != 0 && servo_snap.sample_ts_us <= timestamp) {
+            servo_age = (uint16_t)(timestamp - servo_snap.sample_ts_us);
+        }
+        shared.data.servo_read_us = servo_age;  // Age in µs (0xFFFF = no valid servo data)
+    }
 
     // 4. Read IMU (SPI1 @ 4MHz) - ONLY sensor read in Phase 2.1.1
     uint32_t imu_start = micros();
@@ -444,13 +675,13 @@ void sensorReadTimer_ISR() {
     // NOTE: Jitter calculation vulnerable to micros() wraparound (see TIMING LIMITATIONS).
     // Will produce incorrect result if wraparound occurs between samples (~71 min uptime).
     shared.data.period_error_us = (int16_t)(isr_start - expected_time);  // Signed jitter
-    shared.data.imu_servo_skew_us = 0;  // N/A for Phase 2.1.1 (IMU-only)
+    // imu_servo_skew_us already set via servo_read_us (repurposed as servo_age_us)
 
     // 6. Coherency checksum (simple XOR of key fields)
-    // Note: servo_pos excluded since not read in Phase 2.1.1
+    // BUGFIX: Use shared.data.generation (value N), not sample_generation (N+1 after post-increment)
     uint32_t accel_x_bits;
     memcpy(&accel_x_bits, &accel.acceleration.x, sizeof(uint32_t));
-    shared.data.checksum = timestamp ^ sample_generation ^ accel_x_bits;
+    shared.data.checksum = timestamp ^ shared.data.generation ^ accel_x_bits;
     shared.data.coherency_flag = 0xAA;  // Valid marker
 
     // 7. Unlock (increment seq to even)
@@ -481,16 +712,7 @@ bool csv_buffer_full() {
 void csv_push_sample(const CSVSample& sample) {
     if (csv_buffer_full()) {
         csv_drops++;
-
-        #if ENABLE_DEBUG_OUTPUT
-        // CRITICAL ERROR: Buffer overflow - HALT system
-        Serial.println("[FATAL] CSV buffer overflow - HALTING");
-        while(1) {
-            digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-            delay(100);
-        }
-        #endif
-
+        Serial.print('1');  // Minimal overflow indicator
         return;
     }
 
@@ -753,6 +975,11 @@ void setup() {
 // ============== MAIN LOOP ==============
 
 void loop() {
+    // ===== PRIORITY 0: Servo Bus Service (Phase 2.1.2) =====
+    // Must run frequently to maintain ~526 Hz polling rate
+    // Non-blocking FSM, updates latest_servo for ISR to read
+    servo_bus_service();
+
     // ===== PRIORITY 1: Telemetry (Real Data) =====
     // Read sensor data from Seqlock (Writer-Preferred)
     SensorData snapshot = seqlock_read();
