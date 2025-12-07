@@ -33,8 +33,8 @@
  */
 
 #include <Arduino.h>
-#include <Adafruit_ISM330DHCX.h>
 #include <SPI.h>
+#include "ISM330_Bare.h"
 // ARM Cortex-M7 Data Memory Barrier (for Seqlock synchronization)
 #if defined(__arm__) && defined(__IMXRT1062__)
   // Teensy 4.1 (ARM Cortex-M7) - use inline assembly
@@ -65,7 +65,11 @@
 #define IMU_MISO 12    // Default SPI MISO
 #define IMU_MOSI 11    // Default SPI MOSI
 
-Adafruit_ISM330DHCX imu;
+// ISM330 bare-metal driver scaling constants
+// ±2 g mode: 0.061 mg/LSB (datasheet) -> m/s²
+static const float ACCEL_SENS = 0.061f / 1000.0f * 9.80665f;
+// ±125 dps mode: 4.375 mdps/LSB (datasheet) -> rad/s
+static const float GYRO_SENS = 4.375f / 1000.0f * (PI / 180.0f);
 
 // ============== HARDWARE - SERVO ==============
 // Serial3 @ 1 Mbaud (tested in feetech_servo_timing_test)
@@ -463,8 +467,10 @@ void servo_bus_service() {
             uint32_t t_resp = micros();
             uint32_t t_req = servo_bus.request_sent_us;
 
-            // Calculate midpoint timestamp (best estimate of physical sample time)
-            uint32_t t_sample = (t_req + t_resp) / 2;
+            // t_sample based on t_req + half servo latency
+            // (midpoint is unreliable when loop() is starved by csv_service)
+            const uint32_t SERVO_LATENCY_US = 400;  // STS3032 typical response latency
+            uint32_t t_sample = t_req + SERVO_LATENCY_US / 2;
 
             // Validate response
             bool valid = true;
@@ -521,7 +527,7 @@ void servo_bus_service() {
                 stats.servo_errors++;
             }
 
-            servo_bus.last_poll_us = now_us;
+            servo_bus.last_poll_us = t_req;  // Use request time, not "whenever we noticed"
             servo_bus.state = SERVO_IDLE;
         }
         else if ((now_us - servo_bus.request_sent_us) >= SERVO_TIMEOUT_US) {
@@ -533,7 +539,7 @@ void servo_bus_service() {
             stats.servo_timeouts++;
             stats.servo_errors++;
 
-            servo_bus.last_poll_us = now_us;
+            servo_bus.last_poll_us = servo_bus.request_sent_us;  // Use request time, not "whenever we noticed"
             servo_bus.state = SERVO_IDLE;
         }
         // else: still waiting, stay in SERVO_WAIT_RESPONSE
@@ -649,24 +655,31 @@ void sensorReadTimer_ISR() {
         // Compute servo age: how old is the servo sample at this IMU tick?
         // servo_read_us repurposed as servo_age_us for offline interpolation
         uint16_t servo_age = 0xFFFF;  // Default: invalid/unknown
-        if (servo_snap.sample_ts_us != 0 && servo_snap.sample_ts_us <= timestamp) {
+
+        // Only compute age if servo data is valid (no errors)
+        if (servo_snap.error_code == 0 &&
+            servo_snap.sample_ts_us != 0 &&
+            servo_snap.sample_ts_us <= timestamp) {
             servo_age = (uint16_t)(timestamp - servo_snap.sample_ts_us);
         }
-        shared.data.servo_read_us = servo_age;  // Age in µs (0xFFFF = no valid servo data)
+        // else: leave as 0xFFFF (invalid) if error or bad timestamp
+
+        shared.data.servo_read_us = servo_age;  // Age in µs (0xFFFF = invalid/error)
     }
 
-    // 4. Read IMU (SPI1 @ 4MHz) - ONLY sensor read in Phase 2.1.1
+    // 4. Read IMU (SPI @ 4MHz) - Bare-metal driver (ISR-safe, no allocations)
     uint32_t imu_start = micros();
-    sensors_event_t accel, gyro, temp;
-    imu.getEvent(&accel, &gyro, &temp);
+    ISM330::RawSample raw;
+    ISM330::readRaw(raw);
     uint32_t imu_end = micros();
 
-    shared.data.accel_x_mps2 = accel.acceleration.x;
-    shared.data.accel_y_mps2 = accel.acceleration.y;
-    shared.data.accel_z_mps2 = accel.acceleration.z;
-    shared.data.gyro_x_rads = gyro.gyro.x;
-    shared.data.gyro_y_rads = gyro.gyro.y;
-    shared.data.gyro_z_rads = gyro.gyro.z;
+    // Scale raw int16_t values to physical units (float math OK in ISR on Cortex-M7 with FPU)
+    shared.data.accel_x_mps2 = raw.ax * ACCEL_SENS;
+    shared.data.accel_y_mps2 = raw.ay * ACCEL_SENS;
+    shared.data.accel_z_mps2 = raw.az * ACCEL_SENS;
+    shared.data.gyro_x_rads = raw.gx * GYRO_SENS;
+    shared.data.gyro_y_rads = raw.gy * GYRO_SENS;
+    shared.data.gyro_z_rads = raw.gz * GYRO_SENS;
     shared.data.imu_read_us = imu_end - imu_start;
 
     // 5. Timing diagnostics
@@ -680,7 +693,7 @@ void sensorReadTimer_ISR() {
     // 6. Coherency checksum (simple XOR of key fields)
     // BUGFIX: Use shared.data.generation (value N), not sample_generation (N+1 after post-increment)
     uint32_t accel_x_bits;
-    memcpy(&accel_x_bits, &accel.acceleration.x, sizeof(uint32_t));
+    memcpy(&accel_x_bits, &shared.data.accel_x_mps2, sizeof(uint32_t));
     shared.data.checksum = timestamp ^ shared.data.generation ^ accel_x_bits;
     shared.data.coherency_flag = 0xAA;  // Valid marker
 
@@ -722,11 +735,15 @@ void csv_push_sample(const CSVSample& sample) {
 
 void csv_service() {
     // Phase 1 polling architecture (DMA deferred to Phase 2.3)
-    // Drains up to 64 samples per call to avoid blocking
-    const uint32_t MAX_DRAIN = 64;
+    // Limited drain + time budget to avoid starving servo_bus_service()
+    const uint32_t MAX_DRAIN = 4;        // was 64 - yield more often
+    const uint32_t MAX_BUDGET_US = 500;  // 500µs time budget per call
+    uint32_t start_us = micros();
     uint32_t drained = 0;
 
-    while (csv_tail != csv_head && drained < MAX_DRAIN) {
+    while (csv_tail != csv_head &&
+           drained < MAX_DRAIN &&
+           (micros() - start_us) < MAX_BUDGET_US) {
         CSVSample& sample = csv_ring[csv_tail];
 
         // Write binary sample to Serial4 (BLOCKING - acceptable at 500Hz with 34.7% utilization)
@@ -820,15 +837,17 @@ void setup() {
     Serial.println("\n=== IMU INITIALIZATION ===");
     #endif
 
-    // CS pin setup (matches working Adafruit example)
-    pinMode(IMU_CS, OUTPUT);
-    digitalWrite(IMU_CS, HIGH);
+    // Initialize bare-metal ISM330 driver
+    ISM330::Config imu_cfg;
+    imu_cfg.spi    = &SPI;
+    imu_cfg.cs_pin = IMU_CS;
+    imu_cfg.spi_hz = 4000000;  // 4 MHz (validated in baremetal test)
 
-    // Initialize IMU on default SPI
-    if (!imu.begin_SPI(IMU_CS)) {
+    if (!ISM330::init(imu_cfg)) {
         #if ENABLE_DEBUG_OUTPUT
         Serial.println("[FATAL] Failed to find ISM330DHCX chip");
         Serial.println("Check: Breadboard connections, CS (pin 10), SPI wiring");
+        Serial.println("WHO_AM_I register check failed (expected 0x6B)");
         #endif
         while(1) {
             digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
@@ -836,42 +855,17 @@ void setup() {
         }
     }
 
+    // Give SW_RESET time to complete (datasheet: ~50µs, safe margin: 5ms)
+    delay(5);
+
     #if ENABLE_DEBUG_OUTPUT
     Serial.println("ISM330DHCX Found!");
-    #endif
-
-    // Configure interrupt pins (from working example)
-    imu.configInt1(false, false, true);   // accelerometer DRDY on INT1
-    imu.configInt2(false, true, false);   // gyro DRDY on INT2
-
-    // Note: Adafruit library handles BDU, I2C_disable, DEVICE_CONF internally
-    // Manual register config disabled (was using SPI1 instead of default SPI)
-
-    // Set data rates
-    imu.setAccelDataRate(LSM6DS_RATE_833_HZ);
-    imu.setGyroDataRate(LSM6DS_RATE_833_HZ);
-
-    #if ENABLE_DEBUG_OUTPUT
-    Serial.print("Accelerometer range set to: +-");
-    switch(imu.getAccelRange()) {
-        case LSM6DS_ACCEL_RANGE_2_G: Serial.println("2G"); break;
-        case LSM6DS_ACCEL_RANGE_4_G: Serial.println("4G"); break;
-        case LSM6DS_ACCEL_RANGE_8_G: Serial.println("8G"); break;
-        case LSM6DS_ACCEL_RANGE_16_G: Serial.println("16G"); break;
-    }
-
-    Serial.print("Gyro range set to: ");
-    switch(imu.getGyroRange()) {
-        case LSM6DS_GYRO_RANGE_125_DPS: Serial.println("125 degrees/s"); break;
-        case LSM6DS_GYRO_RANGE_250_DPS: Serial.println("250 degrees/s"); break;
-        case LSM6DS_GYRO_RANGE_500_DPS: Serial.println("500 degrees/s"); break;
-        case LSM6DS_GYRO_RANGE_1000_DPS: Serial.println("1000 degrees/s"); break;
-        case LSM6DS_GYRO_RANGE_2000_DPS: Serial.println("2000 degrees/s"); break;
-        case ISM330DHCX_GYRO_RANGE_4000_DPS: Serial.println("4000 degrees/s"); break;
-    }
-
-    Serial.println("Accelerometer data rate set to: 833 Hz");
-    Serial.println("Gyro data rate set to: 833 Hz");
+    Serial.println("Accelerometer range: ±2 g");
+    Serial.println("Gyro range: ±125 dps");
+    Serial.println("Accelerometer ODR: 208 Hz");
+    Serial.println("Gyro ODR: 208 Hz");
+    Serial.println("SPI Mode: MODE0 @ 4 MHz");
+    Serial.println("Register config: BDU=1, IF_INC=1, I2C_disable=1, DEVICE_CONF=1");
     Serial.println("=== IMU READY ===");
     #endif
 
