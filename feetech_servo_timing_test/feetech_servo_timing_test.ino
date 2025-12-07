@@ -20,6 +20,8 @@
 #define SERVO_BAUD 1000000  // 1 Mbps (default Feetech baud rate)
 #define SERVO_SPEED 200     // Movement speed (0=max speed, 100-300=slow, 1000=very slow)
 #define TEST_ITERATIONS 1000
+#define STREAM_FREQUENCY 100 // Hz for streaming test (100 Hz = 10ms period)
+#define STREAM_DURATION 10  // seconds for streaming test
 
 // ============== FEETECH PROTOCOL ==============
 
@@ -358,6 +360,189 @@ void run_timing_test() {
     Serial.println("\n========================================");
 }
 
+// ============== STREAMING TEST DATA STRUCTURES ==============
+
+struct CycleMetrics {
+    uint32_t write_us;
+    uint32_t read_us;
+    uint32_t total_us;
+    uint32_t cycle_us;
+    uint8_t  echo_bytes;
+    bool     read_success;
+    int32_t  position;
+};
+
+struct StreamingStats {
+    // Timing min/max/sum
+    CycleMetrics min_metrics;
+    CycleMetrics max_metrics;
+    uint64_t sum_write_us;
+    uint64_t sum_read_us;
+    uint64_t sum_total_us;
+    uint64_t sum_cycle_us;
+
+    // Echo
+    uint32_t echo_count;
+    uint32_t total_echo_bytes;
+    uint8_t  max_echo_bytes;
+
+    // Errors
+    uint32_t read_failures;
+    uint32_t timing_violations;  // cycle_us > period
+    uint32_t valid_cycles;
+};
+
+// ============== STREAMING TEST ==============
+
+void run_streaming_test() {
+    Serial.println("\n========================================");
+    Serial.println("Streaming Write+Read Test (100 Hz)");
+    Serial.println("========================================");
+
+    // ===== STEP 1: Read current position =====
+    Serial.print("Reading current servo position... ");
+    uint32_t response_time;
+    int32_t current_pos = read_position(SERVO_ID, &response_time);
+
+    if (current_pos < 0) {
+        Serial.println("ERROR: Cannot read servo position!");
+        return;
+    }
+    Serial.print(current_pos);
+    Serial.println();
+
+    // ===== STEP 2: Configure trajectory =====
+    int32_t center_pos = 2048;         // Center position (STS3215 range: 0-4095)
+    int32_t amplitude = 500;           // ±500 units amplitude
+    float sine_freq = 0.5;             // 0.5 Hz (2 second period for full cycle)
+
+    Serial.println("\nTrajectory Configuration:");
+    Serial.print("  Pattern: Sine wave\n");
+    Serial.print("  Center: "); Serial.println(center_pos);
+    Serial.print("  Amplitude: ±"); Serial.println(amplitude);
+    Serial.print("  Range: "); Serial.print(center_pos - amplitude);
+    Serial.print(" to "); Serial.println(center_pos + amplitude);
+    Serial.print("  Sine frequency: "); Serial.print(sine_freq); Serial.println(" Hz");
+    Serial.print("  Stream rate: "); Serial.print(STREAM_FREQUENCY); Serial.println(" Hz");
+    Serial.print("  Duration: "); Serial.print(STREAM_DURATION); Serial.println(" sec");
+
+    // ===== STEP 3: Move to center position =====
+    Serial.print("\nMoving to center position ("); Serial.print(center_pos); Serial.println(")...");
+    send_sync_write(SERVO_ID, center_pos);
+
+    // Wait for servo to reach center (poll until within tolerance)
+    const int32_t position_tolerance = 10;  // ±10 units
+    const uint32_t move_timeout_ms = 5000;  // 5 second timeout
+    uint32_t move_start = millis();
+    int32_t check_pos = -1;
+    bool reached_target = false;
+
+    while (millis() - move_start < move_timeout_ms) {
+        delay(50);  // Poll every 50ms
+        check_pos = read_position(SERVO_ID, &response_time);
+
+        if (check_pos >= 0) {
+            int32_t error = abs(check_pos - center_pos);
+
+            if (error <= position_tolerance) {
+                reached_target = true;
+                Serial.print("Reached center! Position: "); Serial.print(check_pos);
+                Serial.print(" (error: "); Serial.print(error); Serial.println(" units)");
+                break;
+            }
+
+            // Progress indicator
+            if ((millis() - move_start) % 500 < 100) {
+                Serial.print("  Position: "); Serial.print(check_pos);
+                Serial.print(" (error: "); Serial.print(error); Serial.println(" units)");
+            }
+        }
+    }
+
+    if (!reached_target) {
+        Serial.print("WARNING: Did not reach center within timeout! ");
+        Serial.print("Final position: "); Serial.print(check_pos);
+        Serial.print(" (error: "); Serial.print(abs(check_pos - center_pos));
+        Serial.println(" units)");
+        Serial.println("Proceeding anyway...");
+    }
+
+    // ===== STEP 4: Calculate test parameters =====
+    uint32_t total_writes = STREAM_FREQUENCY * STREAM_DURATION;  // 40 * 10 = 400 writes
+    float period_us = 1000000.0 / STREAM_FREQUENCY;  // 25000 µs = 25 ms
+
+    // ===== STEP 5: Echo tracking variables =====
+    uint32_t echo_count = 0;
+    uint32_t total_echo_bytes = 0;
+    uint32_t max_echo_bytes = 0;
+
+    Serial.println("\nStarting sine wave stream in 2 seconds...");
+    delay(2000);
+
+    Serial.println("Streaming NOW!\n");
+
+    // ===== STEP 6: Main streaming loop =====
+    for (uint32_t i = 0; i < total_writes; i++) {
+        uint32_t cycle_start_us = micros();
+
+        // Calculate target position using sine wave
+        // position(t) = center + amplitude * sin(2π * freq * t)
+        float time_sec = (float)i / STREAM_FREQUENCY;
+        int32_t target_pos = center_pos + (int32_t)(amplitude * sin(2 * PI * sine_freq * time_sec));
+
+        // Clear RX buffer before write (to detect fresh echo)
+        while (Serial3.available()) Serial3.read();
+
+        // Send position command
+        send_sync_write(SERVO_ID, target_pos);
+
+        // Check for TX echo after a brief delay
+        delayMicroseconds(200);  // Wait for potential echo to arrive
+
+        uint8_t echo_bytes = Serial3.available();
+        if (echo_bytes > 0) {
+            echo_count++;
+            total_echo_bytes += echo_bytes;
+            if (echo_bytes > max_echo_bytes) max_echo_bytes = echo_bytes;
+
+            // Clear echo from buffer
+            while (Serial3.available()) Serial3.read();
+        }
+
+        // Progress indicator (every 40 writes = 1 second)
+        if ((i + 1) % STREAM_FREQUENCY == 0) {
+            Serial.print(".");
+        }
+
+        // Wait for next cycle (accurate timing)
+        while ((micros() - cycle_start_us) < period_us) {
+            // Busy-wait for precise 40 Hz timing
+        }
+    }
+
+    // ===== STEP 7: Report results =====
+    Serial.println("\n\n========================================");
+    Serial.println("STREAMING TEST RESULTS");
+    Serial.println("========================================");
+    Serial.print("Total writes: "); Serial.println(total_writes);
+    Serial.print("Echo detected: "); Serial.print(echo_count);
+    Serial.print(" / "); Serial.print(total_writes);
+    Serial.print(" ("); Serial.print((echo_count * 100.0) / total_writes, 1);
+    Serial.println("%)");
+
+    if (echo_count > 0) {
+        Serial.print("Total echo bytes: "); Serial.println(total_echo_bytes);
+        Serial.print("Average echo bytes: ");
+        Serial.println((float)total_echo_bytes / echo_count, 1);
+        Serial.print("Max echo bytes: "); Serial.println(max_echo_bytes);
+        Serial.println("\n⚠️  TX ECHO DETECTED!");
+        Serial.println("Expected: 13 bytes per echo (packet size)");
+    } else {
+        Serial.println("\n✅ No TX echo detected!");
+    }
+    Serial.println("========================================\n");
+}
+
 // ============== SETUP ==============
 
 void setup() {
@@ -402,7 +587,9 @@ void setup() {
         }
     }
 
-    Serial.println("\nPress 't' to run timing test...");
+    Serial.println("\nCommands:");
+    Serial.println("  't' - Run timing test (1000 iterations)");
+    Serial.println("  's' - Run streaming test (40 Hz, 10 sec)");
 }
 
 // ============== MAIN LOOP ==============
@@ -412,6 +599,8 @@ void loop() {
         char cmd = Serial.read();
         if (cmd == 't' || cmd == 'T') {
             run_timing_test();
+        } else if (cmd == 's' || cmd == 'S') {
+            run_streaming_test();
         }
     }
 

@@ -50,7 +50,7 @@
 #define SAMPLE_PERIOD_US (1000000UL / SAMPLE_RATE_HZ)  // 2000 µs
 
 #define SERIAL_CSV_BAUD 2000000  // 2 Mbaud
-#define ENABLE_DEBUG_OUTPUT 0    // 0 = silent, 1 = startup + errors
+#define ENABLE_DEBUG_OUTPUT 1    // 0 = silent, 1 = startup + errors
 
 // ============== HARDWARE - IMU ==============
 #define IMU_CS 10      // Default SPI CS (requires 10kΩ pull-down to GND)
@@ -616,7 +616,11 @@ void frame_isr() {
     SEQLOCK_BARRIER();
 
     SensorData& d = shared.data;
-    d.frame_ts_us = isr_start;  // This IS the IMU sample time
+    // NOTE: frame_ts_us is ISR entry time, not actual IMU internal sample time.
+    // True IMU sample occurs inside ISM330's ODR pipeline, ~0-1ms before we read.
+    // For sub-ms accuracy, would need ISM330 FIFO + hardware timestamping.
+    // For <1ms alignment goal, this approximation is acceptable.
+    d.frame_ts_us = isr_start;
     d.frame_index = frame_index++;
 
     // ---- 1) IMU READ FIRST (bare-metal SPI, ~33-130µs) ----
@@ -658,6 +662,11 @@ void frame_isr() {
         d.servo_error_code = s.error_code;
 
         // Compute servo age: how old is the servo sample?
+        // NOTE: micros() wraps every ~70 minutes. Unsigned subtraction handles
+        // wrap correctly (modulo 2^32 arithmetic), so (frame_ts - t_rx) gives
+        // correct age even across wrap boundary. The <= check below may give
+        // false negative at wrap, but for typical <30 min sessions this is fine.
+        // For longer sessions, remove the <= check and rely on error_code only.
         if (s.t_rx_us != 0 && s.t_rx_us <= d.frame_ts_us && s.error_code == 0) {
             d.servo_age_us = (uint16_t)(d.frame_ts_us - s.t_rx_us);
             d.servo_latency_us = (uint16_t)(s.t_rx_us - s.t_req_us);
@@ -775,6 +784,8 @@ void setup() {
 
     // Debug serial
     Serial.begin(115200);
+    delay(100);  // Allow USB serial to initialize
+
     #if ENABLE_DEBUG_OUTPUT
     delay(1000);
     Serial.println("\n========================================");
@@ -785,6 +796,7 @@ void setup() {
 
     // CSV output serial
     Serial4.begin(SERIAL_CSV_BAUD);
+    delay(100);  // Allow Serial4 hardware UART to initialize before handshake
 
     // Custom UART3 driver (replaces Serial3)
     uart3_init(SERVO_BAUD);

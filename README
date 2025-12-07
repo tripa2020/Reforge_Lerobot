@@ -13,7 +13,7 @@ Hardware
 Projects
 --------
 Lerobot_RM_Phase1/    IMU-only @ 500Hz (validated)
-Lerobot_RM_Phase2/    IMU + Servo with Seqlock
+Lerobot_RM_Phase2/    IMU + Servo with Seqlock (validated)
 adafruit_ism330dhcx_test/    IMU test sketch
 feetech_servo_timing_test/   Servo timing test
 
