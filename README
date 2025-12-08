@@ -25,6 +25,15 @@ Phase 2 Features
 - Coherency validation (XOR checksum + torn read detection)
 - Non-blocking debug ring buffer (rate-limited drain)
 
+Phase 3 Features
+----------------
+- Full interrupt-driven, multi-rate real-time control and data-acquisition stack
+- Rate-Monotonic scheduling via hardware timer/NVIC priorities
+- Synchronize IMU and servo encoder data with sub-300 µs temporal skew 
+- Writer-Preferred Seqlock (lock-free ISR->main sync) 
+- Robust non-blocking logging ring buffer (rate-limited drain) 
+
+
 Usage
 -----
 1. Flash firmware via Arduino IDE

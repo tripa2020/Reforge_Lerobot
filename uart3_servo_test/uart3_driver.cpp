@@ -32,10 +32,12 @@ UART3Stats uart3_stats = {0, 0, 0, 0, 0};
 
 // ============== LPUART2 ISR (Serial3) ==============
 
-// Forward declaration for ISR
-static void lpuart2_isr(void);
+// ISR must NOT be static - needs external linkage for interrupt vector
+// FASTRUN ensures ISR is in RAM for fast execution on Teensy 4.x
+FASTRUN void lpuart2_isr(void) {
+    // DEBUG: Toggle pin 13 to verify ISR is being called
+    digitalToggleFast(LED_BUILTIN);
 
-static void lpuart2_isr(void) {
     uart3_stats.isr_count++;
 
     // NOTE: Using LPUART2 registers because Serial3 == LPUART2
@@ -127,6 +129,38 @@ void uart3_init(uint32_t baud) {
     uart3_stats = {0, 0, 0, 0, 0};
 
     __enable_irq();
+
+    // DEBUG: Print register state to verify configuration
+    Serial.println("\n[UART3 DEBUG] Register state after init:");
+    Serial.print("  LPUART2_CTRL = 0x");
+    Serial.println(LPUART2_CTRL, HEX);
+    Serial.print("  LPUART2_STAT = 0x");
+    Serial.println(LPUART2_STAT, HEX);
+    Serial.print("  LPUART2_FIFO = 0x");
+    Serial.println(LPUART2_FIFO, HEX);
+    Serial.print("  LPUART2_WATER = 0x");
+    Serial.println(LPUART2_WATER, HEX);
+
+    // Check if NVIC interrupt is enabled
+    Serial.print("  IRQ_LPUART2 = ");
+    Serial.println(IRQ_LPUART2);
+    Serial.print("  NVIC enabled = ");
+    Serial.println(NVIC_IS_ENABLED(IRQ_LPUART2) ? "YES" : "NO");
+
+    // Check key CTRL bits
+    Serial.print("  RIE (RX int) = ");
+    Serial.println((LPUART2_CTRL & LPUART_CTRL_RIE) ? "ENABLED" : "disabled");
+    Serial.print("  TIE (TX int) = ");
+    Serial.println((LPUART2_CTRL & LPUART_CTRL_TIE) ? "ENABLED" : "disabled");
+    Serial.print("  TE (TX enable) = ");
+    Serial.println((LPUART2_CTRL & LPUART_CTRL_TE) ? "ENABLED" : "disabled");
+    Serial.print("  RE (RX enable) = ");
+    Serial.println((LPUART2_CTRL & LPUART_CTRL_RE) ? "ENABLED" : "disabled");
+
+    // Check STAT register for TDRE (TX ready)
+    Serial.print("  TDRE (TX ready) = ");
+    Serial.println((LPUART2_STAT & LPUART_STAT_TDRE) ? "READY" : "busy");
+    Serial.println();
 }
 
 // ============== RX API ==============

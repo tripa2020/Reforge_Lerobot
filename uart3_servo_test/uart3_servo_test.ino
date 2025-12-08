@@ -487,6 +487,21 @@ void setup() {
 // ============== MAIN LOOP ==============
 
 void loop() {
+    // DEBUG: Print ISR stats every second to diagnose hang
+    static uint32_t last_debug = 0;
+    if (millis() - last_debug > 1000) {
+        last_debug = millis();
+        Serial.print("[DEBUG] isr_count=");
+        Serial.print(uart3_stats.isr_count);
+        Serial.print(" tx_bytes=");
+        Serial.print(uart3_stats.tx_bytes);
+        Serial.print(" rx_bytes=");
+        Serial.print(uart3_stats.rx_bytes);
+        Serial.print(" tx_ring: h=");
+        Serial.print(uart3_stats.tx_overflow);  // Using overflow as proxy
+        Serial.println();
+    }
+
     // Priority 1: Service RX (parse incoming bytes)
     service_rx();
 

@@ -392,6 +392,293 @@ struct StreamingStats {
     uint32_t valid_cycles;
 };
 
+// ============== ECHO DIAGNOSTIC TEST ==============
+
+void run_echo_diagnostic() {
+    Serial.println("\n========================================");
+    Serial.println("Echo Diagnostic & Mitigation Test");
+    Serial.println("========================================");
+
+    // Test multiple echo delay times
+    uint16_t delays_us[] = {100, 200, 300, 500, 1000, 2000};
+    const uint8_t num_delays = 6;
+
+    Serial.println("\nTesting echo delay timings...");
+    Serial.println("Delay(µs) | Captures | Avg Bytes | Max Bytes");
+    Serial.println("----------|----------|-----------|----------");
+
+    for (uint8_t d = 0; d < num_delays; d++) {
+        uint16_t test_delay = delays_us[d];
+        uint32_t captures = 0;
+        uint32_t total_bytes = 0;
+        uint8_t max_bytes = 0;
+        const uint8_t test_count = 50;
+
+        for (uint8_t i = 0; i < test_count; i++) {
+            // Clear buffer
+            while (Serial3.available()) Serial3.read();
+
+            // Send write command
+            send_sync_write(SERVO_ID, 2048);
+
+            // Wait specified delay
+            delayMicroseconds(test_delay);
+
+            // Check echo
+            uint8_t avail = Serial3.available();
+            if (avail > 0) {
+                captures++;
+                total_bytes += avail;
+                if (avail > max_bytes) max_bytes = avail;
+                // Clear buffer
+                while (Serial3.available()) Serial3.read();
+            }
+
+            delay(20);  // Wait between tests
+        }
+
+        float avg_bytes = captures > 0 ? (float)total_bytes / captures : 0;
+
+        Serial.print(test_delay);
+        Serial.print("      | ");
+        Serial.print(captures);
+        Serial.print("/");
+        Serial.print(test_count);
+        Serial.print("     | ");
+        Serial.print(avg_bytes, 1);
+        Serial.print("        | ");
+        Serial.println(max_bytes);
+    }
+
+    Serial.println();
+
+    // ===== ECHO BYTE ANALYSIS =====
+    Serial.println("--- Echo Byte Dump (first 10 occurrences) ---");
+    Serial.println("Collecting echo samples with 500µs delay...\n");
+
+    uint8_t dump_count = 0;
+    const uint8_t max_dumps = 10;
+
+    while (dump_count < max_dumps) {
+        // Clear buffer
+        while (Serial3.available()) Serial3.read();
+
+        // Send write command (store packet for comparison)
+        uint8_t write_packet[13];
+        write_packet[0] = FEETECH_HEADER_1;
+        write_packet[1] = FEETECH_HEADER_2;
+        write_packet[2] = SERVO_ID;
+        write_packet[3] = 0x09;
+        write_packet[4] = INSTR_WRITE_DATA;
+        write_packet[5] = REG_GOAL_POSITION_L;
+        write_packet[6] = (2048) & 0xFF;
+        write_packet[7] = (2048 >> 8) & 0xFF;
+        write_packet[8] = 0x00;
+        write_packet[9] = 0x00;
+        write_packet[10] = SERVO_SPEED & 0xFF;
+        write_packet[11] = (SERVO_SPEED >> 8) & 0xFF;
+        write_packet[12] = calculate_checksum(write_packet, 13);
+
+        Serial3.write(write_packet, 13);
+        Serial3.flush();
+
+        // Wait for echo
+        delayMicroseconds(500);
+
+        uint8_t avail = Serial3.available();
+        if (avail > 0) {
+            uint8_t echo_buf[32];
+            uint8_t read_count = 0;
+
+            while (Serial3.available() && read_count < 32) {
+                echo_buf[read_count++] = Serial3.read();
+            }
+
+            Serial.print("Echo #");
+            Serial.print(dump_count + 1);
+            Serial.print(" (");
+            Serial.print(read_count);
+            Serial.print(" bytes): ");
+
+            for (uint8_t i = 0; i < read_count; i++) {
+                if (echo_buf[i] < 0x10) Serial.print("0");
+                Serial.print(echo_buf[i], HEX);
+                Serial.print(" ");
+            }
+
+            Serial.println();
+
+            // Compare to sent packet
+            Serial.print("  Sent packet: ");
+            for (uint8_t i = 0; i < 13; i++) {
+                if (write_packet[i] < 0x10) Serial.print("0");
+                Serial.print(write_packet[i], HEX);
+                Serial.print(" ");
+            }
+            Serial.println();
+
+            // Check if echo matches start of packet
+            bool matches_start = true;
+            for (uint8_t i = 0; i < read_count && i < 13; i++) {
+                if (echo_buf[i] != write_packet[i]) {
+                    matches_start = false;
+                    break;
+                }
+            }
+
+            if (matches_start) {
+                Serial.println("  ✓ Matches start of TX packet");
+            } else {
+                Serial.println("  ✗ Does NOT match TX packet");
+            }
+
+            Serial.println();
+
+            dump_count++;
+        }
+
+        delay(50);
+    }
+
+    // ===== MITIGATION STRATEGIES TEST =====
+    Serial.println("--- Testing Mitigation Strategies ---");
+    Serial.println();
+
+    // Strategy 1: Aggressive clearing with timeout
+    Serial.println("Strategy 1: Wait + Clear (500µs wait, clear all)");
+    uint32_t s1_success = 0;
+    uint32_t s1_total = 100;
+
+    for (uint32_t i = 0; i < s1_total; i++) {
+        // Clear before
+        while (Serial3.available()) Serial3.read();
+
+        // Write
+        send_sync_write(SERVO_ID, 2048);
+
+        // Wait for echo to fully arrive
+        delayMicroseconds(500);
+
+        // Aggressively clear everything
+        while (Serial3.available()) Serial3.read();
+
+        // Now read position
+        uint32_t resp_time;
+        int32_t pos = read_position(SERVO_ID, &resp_time);
+
+        if (pos >= 0) s1_success++;
+
+        delay(10);
+    }
+
+    Serial.print("  Success rate: ");
+    Serial.print(s1_success);
+    Serial.print("/");
+    Serial.print(s1_total);
+    Serial.print(" (");
+    Serial.print((s1_success * 100.0) / s1_total, 1);
+    Serial.println("%)");
+    Serial.println();
+
+    // Strategy 2: Timed delay between write and read
+    Serial.println("Strategy 2: Fixed delay (1ms between write and read)");
+    uint32_t s2_success = 0;
+    uint32_t s2_total = 100;
+
+    for (uint32_t i = 0; i < s2_total; i++) {
+        // Clear before
+        while (Serial3.available()) Serial3.read();
+
+        // Write
+        send_sync_write(SERVO_ID, 2048);
+
+        // Wait 1ms for servo to process
+        delayMicroseconds(1000);
+
+        // Clear any residual echo
+        while (Serial3.available()) Serial3.read();
+
+        // Now read position
+        uint32_t resp_time;
+        int32_t pos = read_position(SERVO_ID, &resp_time);
+
+        if (pos >= 0) s2_success++;
+
+        delay(10);
+    }
+
+    Serial.print("  Success rate: ");
+    Serial.print(s2_success);
+    Serial.print("/");
+    Serial.print(s2_total);
+    Serial.print(" (");
+    Serial.print((s2_success * 100.0) / s2_total, 1);
+    Serial.println("%)");
+    Serial.println();
+
+    // Strategy 3: Header detection (skip echo, wait for servo response)
+    Serial.println("Strategy 3: Header detection (skip until 0xFF 0xFF from servo)");
+    uint32_t s3_success = 0;
+    uint32_t s3_total = 100;
+
+    for (uint32_t i = 0; i < s3_total; i++) {
+        // Clear before
+        while (Serial3.available()) Serial3.read();
+
+        // Write
+        send_sync_write(SERVO_ID, 2048);
+
+        // Wait a bit
+        delayMicroseconds(300);
+
+        // Skip echo bytes (first 13 bytes or until timeout)
+        uint8_t skipped = 0;
+        uint32_t skip_start = millis();
+        while (skipped < 13 && (millis() - skip_start) < 5) {
+            if (Serial3.available()) {
+                Serial3.read();
+                skipped++;
+            }
+        }
+
+        // Now read position
+        uint32_t resp_time;
+        int32_t pos = read_position(SERVO_ID, &resp_time);
+
+        if (pos >= 0) s3_success++;
+
+        delay(10);
+    }
+
+    Serial.print("  Success rate: ");
+    Serial.print(s3_success);
+    Serial.print("/");
+    Serial.print(s3_total);
+    Serial.print(" (");
+    Serial.print((s3_success * 100.0) / s3_total, 1);
+    Serial.println("%)");
+    Serial.println();
+
+    Serial.println("========================================");
+    Serial.println("RECOMMENDATION:");
+
+    uint32_t best_success = max(s1_success, max(s2_success, s3_success));
+
+    if (best_success == s1_success) {
+        Serial.println("Use Strategy 1: 500µs wait + aggressive clear");
+        Serial.println("  delayMicroseconds(500);");
+        Serial.println("  while(Serial3.available()) Serial3.read();");
+    } else if (best_success == s2_success) {
+        Serial.println("Use Strategy 2: 1ms delay between write and read");
+        Serial.println("  delayMicroseconds(1000);");
+    } else {
+        Serial.println("Use Strategy 3: Skip first 13 bytes after write");
+        Serial.println("  for(uint8_t i=0; i<13; i++) if(Serial3.available()) Serial3.read();");
+    }
+
+    Serial.println("========================================\n");
+}
+
 // ============== STREAMING TEST ==============
 
 void run_streaming_test() {
@@ -468,13 +755,18 @@ void run_streaming_test() {
     }
 
     // ===== STEP 4: Calculate test parameters =====
-    uint32_t total_writes = STREAM_FREQUENCY * STREAM_DURATION;  // 40 * 10 = 400 writes
-    float period_us = 1000000.0 / STREAM_FREQUENCY;  // 25000 µs = 25 ms
+    uint32_t total_cycles = STREAM_FREQUENCY * STREAM_DURATION;  // 100 * 10 = 1000 cycles
+    uint32_t period_us = 1000000UL / STREAM_FREQUENCY;  // 10000 µs = 10 ms
 
-    // ===== STEP 5: Echo tracking variables =====
-    uint32_t echo_count = 0;
-    uint32_t total_echo_bytes = 0;
-    uint32_t max_echo_bytes = 0;
+    // ===== STEP 5: Initialize statistics =====
+    StreamingStats stats;
+    memset(&stats, 0, sizeof(stats));
+
+    // Initialize min values to max
+    stats.min_metrics.write_us = 0xFFFFFFFF;
+    stats.min_metrics.read_us = 0xFFFFFFFF;
+    stats.min_metrics.total_us = 0xFFFFFFFF;
+    stats.min_metrics.cycle_us = 0xFFFFFFFF;
 
     Serial.println("\nStarting sine wave stream in 2 seconds...");
     delay(2000);
@@ -482,8 +774,10 @@ void run_streaming_test() {
     Serial.println("Streaming NOW!\n");
 
     // ===== STEP 6: Main streaming loop =====
-    for (uint32_t i = 0; i < total_writes; i++) {
+    for (uint32_t i = 0; i < total_cycles; i++) {
         uint32_t cycle_start_us = micros();
+        CycleMetrics m;
+        memset(&m, 0, sizeof(m));
 
         // Calculate target position using sine wave
         // position(t) = center + amplitude * sin(2π * freq * t)
@@ -493,53 +787,173 @@ void run_streaming_test() {
         // Clear RX buffer before write (to detect fresh echo)
         while (Serial3.available()) Serial3.read();
 
-        // Send position command
+        // ===== WRITE PHASE (DWT timing) =====
+        uint32_t write_start = dwt_get_cycles();
         send_sync_write(SERVO_ID, target_pos);
+        uint32_t write_end = dwt_get_cycles();
+        m.write_us = cycles_to_us(write_end - write_start);
 
-        // Check for TX echo after a brief delay
+        // ===== ECHO DETECTION =====
         delayMicroseconds(200);  // Wait for potential echo to arrive
+        m.echo_bytes = Serial3.available();
 
-        uint8_t echo_bytes = Serial3.available();
-        if (echo_bytes > 0) {
-            echo_count++;
-            total_echo_bytes += echo_bytes;
-            if (echo_bytes > max_echo_bytes) max_echo_bytes = echo_bytes;
-
+        if (m.echo_bytes > 0) {
+            stats.echo_count++;
+            stats.total_echo_bytes += m.echo_bytes;
+            if (m.echo_bytes > stats.max_echo_bytes) {
+                stats.max_echo_bytes = m.echo_bytes;
+            }
             // Clear echo from buffer
             while (Serial3.available()) Serial3.read();
         }
 
-        // Progress indicator (every 40 writes = 1 second)
+        // ===== READ PHASE (DWT timing) =====
+        uint32_t read_response_us;
+        uint32_t read_start = dwt_get_cycles();
+        int32_t pos = read_position(SERVO_ID, &read_response_us);
+        uint32_t read_end = dwt_get_cycles();
+        m.read_us = cycles_to_us(read_end - read_start);
+
+        if (pos >= 0) {
+            m.read_success = true;
+            m.position = pos;
+            stats.valid_cycles++;
+        } else {
+            m.read_success = false;
+            m.position = -1;
+            stats.read_failures++;
+        }
+
+        // ===== CYCLE METRICS =====
+        m.total_us = m.write_us + m.read_us;
+        m.cycle_us = micros() - cycle_start_us;
+
+        if (m.cycle_us > period_us) {
+            stats.timing_violations++;
+        }
+
+        // ===== UPDATE STATISTICS =====
+        // Min
+        if (m.write_us < stats.min_metrics.write_us) stats.min_metrics.write_us = m.write_us;
+        if (m.read_us < stats.min_metrics.read_us) stats.min_metrics.read_us = m.read_us;
+        if (m.total_us < stats.min_metrics.total_us) stats.min_metrics.total_us = m.total_us;
+        if (m.cycle_us < stats.min_metrics.cycle_us) stats.min_metrics.cycle_us = m.cycle_us;
+
+        // Max
+        if (m.write_us > stats.max_metrics.write_us) stats.max_metrics.write_us = m.write_us;
+        if (m.read_us > stats.max_metrics.read_us) stats.max_metrics.read_us = m.read_us;
+        if (m.total_us > stats.max_metrics.total_us) stats.max_metrics.total_us = m.total_us;
+        if (m.cycle_us > stats.max_metrics.cycle_us) stats.max_metrics.cycle_us = m.cycle_us;
+
+        // Sum
+        stats.sum_write_us += m.write_us;
+        stats.sum_read_us += m.read_us;
+        stats.sum_total_us += m.total_us;
+        stats.sum_cycle_us += m.cycle_us;
+
+        // Progress indicator (every 100 writes = 1 second)
         if ((i + 1) % STREAM_FREQUENCY == 0) {
             Serial.print(".");
         }
 
         // Wait for next cycle (accurate timing)
         while ((micros() - cycle_start_us) < period_us) {
-            // Busy-wait for precise 40 Hz timing
+            // Busy-wait for precise 100 Hz timing
         }
     }
 
     // ===== STEP 7: Report results =====
     Serial.println("\n\n========================================");
-    Serial.println("STREAMING TEST RESULTS");
+    Serial.println("STREAMING TEST RESULTS (100 Hz)");
     Serial.println("========================================");
-    Serial.print("Total writes: "); Serial.println(total_writes);
-    Serial.print("Echo detected: "); Serial.print(echo_count);
-    Serial.print(" / "); Serial.print(total_writes);
-    Serial.print(" ("); Serial.print((echo_count * 100.0) / total_writes, 1);
+    Serial.print("Total cycles: "); Serial.println(total_cycles);
+    Serial.print("Valid cycles: "); Serial.print(stats.valid_cycles);
+    Serial.print(" ("); Serial.print((stats.valid_cycles * 100.0) / total_cycles, 1);
+    Serial.println("%)");
+    Serial.print("Read failures: "); Serial.print(stats.read_failures);
+    Serial.print(" ("); Serial.print((stats.read_failures * 100.0) / total_cycles, 1);
+    Serial.println("%)");
+    Serial.print("Timing violations: "); Serial.print(stats.timing_violations);
+    Serial.print(" (cycle > 10ms, ");
+    Serial.print((stats.timing_violations * 100.0) / total_cycles, 1);
+    Serial.println("%)");
+    Serial.println();
+
+    // Calculate averages
+    float avg_write = (float)stats.sum_write_us / total_cycles;
+    float avg_read = (float)stats.sum_read_us / total_cycles;
+    float avg_total = (float)stats.sum_total_us / total_cycles;
+    float avg_cycle = (float)stats.sum_cycle_us / total_cycles;
+
+    // Timing breakdown
+    Serial.println("--- Timing Breakdown (µs) ---");
+    Serial.println("Operation         | Min    | Max    | Avg");
+    Serial.println("------------------|--------|--------|--------");
+
+    Serial.print("Write (13 bytes)  | ");
+    Serial.print(stats.min_metrics.write_us); Serial.print("   | ");
+    Serial.print(stats.max_metrics.write_us); Serial.print("   | ");
+    Serial.println(avg_write, 1);
+
+    Serial.print("Read (8+8 bytes)  | ");
+    Serial.print(stats.min_metrics.read_us); Serial.print("   | ");
+    Serial.print(stats.max_metrics.read_us); Serial.print("   | ");
+    Serial.println(avg_read, 1);
+
+    Serial.print("Total (W+R)       | ");
+    Serial.print(stats.min_metrics.total_us); Serial.print("   | ");
+    Serial.print(stats.max_metrics.total_us); Serial.print("   | ");
+    Serial.println(avg_total, 1);
+
+    Serial.print("Cycle Period      | ");
+    Serial.print(stats.min_metrics.cycle_us); Serial.print("   | ");
+    Serial.print(stats.max_metrics.cycle_us); Serial.print("   | ");
+    Serial.println(avg_cycle, 1);
+
+    Serial.println();
+
+    // Echo statistics
+    Serial.println("--- Echo Detection ---");
+    Serial.print("Echo detected: "); Serial.print(stats.echo_count);
+    Serial.print(" / "); Serial.print(total_cycles);
+    Serial.print(" ("); Serial.print((stats.echo_count * 100.0) / total_cycles, 1);
     Serial.println("%)");
 
-    if (echo_count > 0) {
-        Serial.print("Total echo bytes: "); Serial.println(total_echo_bytes);
+    if (stats.echo_count > 0) {
+        Serial.print("Total echo bytes: "); Serial.println(stats.total_echo_bytes);
         Serial.print("Average echo bytes: ");
-        Serial.println((float)total_echo_bytes / echo_count, 1);
-        Serial.print("Max echo bytes: "); Serial.println(max_echo_bytes);
-        Serial.println("\n⚠️  TX ECHO DETECTED!");
-        Serial.println("Expected: 13 bytes per echo (packet size)");
+        Serial.println((float)stats.total_echo_bytes / stats.echo_count, 1);
+        Serial.print("Max echo bytes: "); Serial.println(stats.max_echo_bytes);
+        Serial.println("⚠️  TX ECHO DETECTED!");
+        Serial.println("Expected: 13 bytes per echo (write packet size)");
+
+        if (stats.read_failures > 0) {
+            Serial.println("⚠️  Echo may be interfering with position reads!");
+        }
     } else {
-        Serial.println("\n✅ No TX echo detected!");
+        Serial.println("✅ No TX echo detected!");
     }
+    Serial.println();
+
+    // Phase 3 compatibility analysis
+    Serial.println("--- Phase 3 Compatibility @ 500 Hz ---");
+    Serial.print("ISR period: 2000 µs\n");
+    Serial.print("Write+Read (avg): "); Serial.print(avg_total, 1); Serial.println(" µs");
+    Serial.print("IMU read (Phase 1): 35 µs\n");
+
+    float total_isr = 35 + avg_total;
+    float utilization = (total_isr / 2000.0) * 100.0;
+
+    Serial.print("Total ISR budget: "); Serial.print(total_isr, 1); Serial.println(" µs");
+    Serial.print("Utilization: "); Serial.print(utilization, 1); Serial.println("%");
+
+    if (total_isr < 2000) {
+        Serial.print("Margin: "); Serial.print(2000 - total_isr, 1); Serial.println(" µs");
+        Serial.println("✅ SCHEDULABLE for 500 Hz Phase 3");
+    } else {
+        Serial.println("❌ WARNING: Exceeds 500 Hz budget!");
+    }
+
     Serial.println("========================================\n");
 }
 
@@ -588,8 +1002,9 @@ void setup() {
     }
 
     Serial.println("\nCommands:");
-    Serial.println("  't' - Run timing test (1000 iterations)");
-    Serial.println("  's' - Run streaming test (40 Hz, 10 sec)");
+    Serial.println("  't' - Run timing test (1000 iterations, read-only)");
+    Serial.println("  's' - Run streaming test (100 Hz, 10 sec, write+read+echo)");
+    Serial.println("  'e' - Run echo diagnostic & mitigation test");
 }
 
 // ============== MAIN LOOP ==============
@@ -601,6 +1016,8 @@ void loop() {
             run_timing_test();
         } else if (cmd == 's' || cmd == 'S') {
             run_streaming_test();
+        } else if (cmd == 'e' || cmd == 'E') {
+            run_echo_diagnostic();
         }
     }
 
