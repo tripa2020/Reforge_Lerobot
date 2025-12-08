@@ -14,7 +14,7 @@ Projects
 --------
 Lerobot_RM_Phase1/    IMU-only @ 500Hz (validated)
 Lerobot_RM_Phase2/    IMU + Servo with Seqlock (validated)
-Lerobot_RM_Phase3/    Full multirate realtime control and data aquistion stack
+Lerobot_RM_Phase3/    Full multirate realtime control and data acquisition stack
 adafruit_ism330dhcx_test/    IMU test sketch
 feetech_servo_timing_test/   Servo timing test
 
@@ -49,5 +49,51 @@ MOSI -> Pin 26
 MISO -> Pin 1
 VCC  -> 3.3V
 GND  -> GND
+
+
+12/8/25 Update 
+---------------
+
+Section 1 -> Progress towards goal 
+- Phase 3 is the complete core implementation of the control and data acquisitions stack 
+- Time from IMU reading -> Encoder reading is under 300 µs
+- schedules servo encoder read requests [500Hz] and servo position write request [100Hz]
+- Use Deferred interrupt pattern at 500Hz, to queue these read and write request, all arbitrated by a FSM
+- Robust logging and documentation times, for all events. Line 82 where the sensor data struct lives defines this.  
+- ***one cycle pipeline***, IMU data from frame{k} corresponds to Encoder data frame{k-1} this 1 phase offset is handled in parse_phase3_csv.py
+- I have already architected the serial stream of generateSineSweep, and will implement tonight.
+- Scheduled talk with friend doing imitation learning at MIT to come up with good benchmark tests 
+- **After this: last step is pure Covalent side orchestration and data processing** 
+
+Section 2 -> architecture
+- 3 virtualized CPUs with different priorities 
+   - CPU A -> Frame_ISR[500hz] line 690
+      - highest priority every 2000 µs
+      - snapshots the imu (33 µs)
+      - checks the state of the servo 
+      - if no message is sent it sets flag to queue a servo read/write request
+      - **no I/O just flag setter**
+      -  returns in under 50 us
+   - CPU B -> Triggered by serial rx (servo return)
+      - second highest priority 
+      - pushes bytes from the internal Serial 3 buffer to be processed in the main loop 
+   - CPU C -> the meat and potatoes 
+      - Lowest Priority 
+      - these are the processes that run every iteration, and execute all i/o functionality 
+      - where all logging, servo read and write etc is done
+      - line 990  
+
+Section 3 -> Steps to Replicate 
+1. flash Lerobot_RM_Phase3.ino to the Teensy 
+2. once flashed ask linux if there is any information coming over serial port  
+   stty -F /dev/ttyUSB0 2000000 raw -echo
+   Teensy should be sending **READY** every second
+3. Run python3 /home/alex/Arduino/Reforge_Lerobot/Lerobot_RM_Phase3/parse_phase3_csv.py /dev/ttyUSB0 2000000 -o test.csv -v
+4. This initiates the handshake between the Teensy and Python and starts the data collection process 
+5. Press Ctrl + C to stop the test, and produce results 
+
+
+
+
 
 
