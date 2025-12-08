@@ -36,6 +36,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include "ISM330_Bare.h"
+#include "TrajectoryGenerator.h"
 // NOTE: uart3_driver removed - using Serial3 directly (ISR attachment broken)
 
 // ARM Cortex-M7 Data Memory Barrier (for Seqlock synchronization)
@@ -136,6 +137,10 @@ volatile ServoState latest_servo = {
     0xFF,     // error_code: not initialized
     0         // generation
 };
+
+// Command tracking (for logging commanded vs actual position)
+volatile uint32_t g_last_cmd_time_us = 0;
+volatile uint16_t g_last_cmd_goal = 0xFFFF;  // Sentinel: no command sent yet
 
 // ============== SERVO RX FSM ==============
 
@@ -256,6 +261,17 @@ struct Statistics {
 volatile Statistics stats = {0};
 uint32_t last_stats_print_ms = 0;
 
+// ============== INTERNAL TRAJECTORY GENERATOR ==============
+// Step 1: Set enabled=false, use static target via enqueue in setup()
+// Step 2: Set enabled=true to generate sine wave
+// Step 3: Capture CSV while moving
+TrajectoryGenerator trajectory(
+    2048,   // center_pos (STS3215 center)
+    500,    // amplitude (±500 units)
+    0.5f,   // sine_freq_hz (0.5 Hz = 2 sec period)
+    40      // update_rate_hz (40 Hz command rate)
+);
+
 // ============== ISR FLAGS ==============
 volatile bool isr_active = false;
 volatile bool logging_active = false;
@@ -269,6 +285,7 @@ void servo_timeout_service();
 void servo_protocol_fsm();
 void servo_read_service();     // Sends READ when frame_isr sets flag
 void servo_write_scheduler();
+void internal_trajectory_service();  // Generates trajectory commands
 void process_servo_frame(const uint8_t* buf, uint8_t len, uint32_t t_rx);
 uint8_t calculate_checksum(const uint8_t* data, uint8_t len);
 bool queue_servo_read_request();  // Called from frame_isr
@@ -555,6 +572,21 @@ void process_servo_frame(const uint8_t* buf, uint8_t len, uint32_t t_rx) {
     servo_bus.state = BUS_IDLE;
 }
 
+// ============== INTERNAL TRAJECTORY SERVICE ==============
+// Generates trajectory commands and enqueues them
+// Only active when trajectory.isEnabled() == true
+
+void internal_trajectory_service() {
+    // Get next trajectory target (returns -1 if not time to update yet)
+    int32_t target = trajectory.update();
+
+    if (target >= 0) {
+        // Enqueue the goal command
+        // If queue is full, stats.cmd_queue_overflows will increment
+        enqueue_goal_cmd(SERVO_ID, (uint16_t)target, 0);  // speed=0 for max speed
+    }
+}
+
 // ============== SERVO WRITE SCHEDULER ==============
 
 void servo_write_scheduler() {
@@ -586,6 +618,10 @@ void servo_write_scheduler() {
 
     servo_transport_flush_rx();
     servo_transport_write(pkt, 11);
+
+    // Capture command for logging (enables tracking error analysis)
+    g_last_cmd_time_us = now_us;
+    g_last_cmd_goal = cmd.goal_position;
 
     servo_bus.write_request_sent_us = now_us;
     servo_bus.last_write_us = now_us;
@@ -733,6 +769,19 @@ void frame_isr() {
     uint32_t isr_end = micros();
     d.isr_total_us = isr_end - isr_start;
     d.period_error_us = (int16_t)(isr_start - expected_time);
+
+    // ---- 4.5) PACK COMMAND TRACKING INTO RESERVED BYTES ----
+    // Pack cmd_goal (2 bytes) + cmd_time_us (4 bytes) = 6 bytes total
+    // Little-endian byte order for parser compatibility
+    uint16_t cmd_goal = g_last_cmd_goal;
+    uint32_t cmd_time = g_last_cmd_time_us;
+
+    d.reserved[0] = (uint8_t)(cmd_goal & 0xFF);
+    d.reserved[1] = (uint8_t)((cmd_goal >> 8) & 0xFF);
+    d.reserved[2] = (uint8_t)(cmd_time & 0xFF);
+    d.reserved[3] = (uint8_t)((cmd_time >> 8) & 0xFF);
+    d.reserved[4] = (uint8_t)((cmd_time >> 16) & 0xFF);
+    d.reserved[5] = (uint8_t)((cmd_time >> 24) & 0xFF);
 
     // ---- 5) COHERENCY CHECKSUM ----
     uint32_t accel_bits;
@@ -915,6 +964,19 @@ void setup() {
 
     logging_active = true;
 
+    // ============== STEP 1: STATIC TARGET TEST ==============
+    // Enqueue a single static command to center position
+    // This tests that the command queue -> write scheduler -> bus manager works
+    // Comment this out for Step 2 (sine trajectory test)
+    #if ENABLE_DEBUG_OUTPUT
+    Serial.println("*** Step 1: Enqueueing static target (2048) ***");
+    #endif
+    enqueue_goal_cmd(SERVO_ID, trajectory.getStaticTarget(), 0);
+
+    // ============== STEP 2: ENABLE SINE TRAJECTORY (COMMENT OUT STEP 1 FIRST) ==============
+    // Uncomment the line below to enable internal sine wave generation
+    trajectory.setEnabled(true);
+
     #if ENABLE_DEBUG_OUTPUT
     Serial.println("*** LOGGING ACTIVE ***");
     Serial.println("Frame ISR @ 500Hz (priority 32)");
@@ -936,6 +998,10 @@ void loop() {
     // ===== PRIORITY 2: Servo Read Service (send READs requested by frame_isr) =====
     // Frame ISR sets request_queued flag; this sends the actual READ packet
     servo_read_service();
+
+    // ===== PRIORITY 2.5: Internal Trajectory Generator (optional) =====
+    // Generates sine wave commands and enqueues them (only if enabled)
+    internal_trajectory_service();
 
     // ===== PRIORITY 3: Servo Write Scheduler (goal commands @ 40-100Hz) =====
     servo_write_scheduler();

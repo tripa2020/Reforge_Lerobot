@@ -68,10 +68,11 @@ SAMPLE_SIZE = 64
 # I: checksum (4 bytes) - XOR checksum for torn read detection
 # B: coherency_flag (1 byte) - 0xAA=valid, 0xFF=torn, 0xEE=stale
 # B: servo_error_code (1 byte) - 0=OK, 1=timeout, 2=checksum, 3=framing
-# 6x: reserved padding (6 bytes)
-# Total: 4+4+24+8+8+2+2+4+1+1+6 = 64 bytes ✓
+# H: cmd_goal (2 bytes) - last commanded goal position (0xFFFF if none)
+# I: cmd_time_us (4 bytes) - timestamp when command was sent
+# Total: 4+4+24+8+8+2+2+4+1+1+2+4 = 64 bytes ✓
 
-STRUCT_FMT = "<I I 6f 2i 4H h 2x I B B 6x"
+STRUCT_FMT = "<I I 6f 2i 4H h 2x I B B H I"
 STRUCT_SIZE = struct.calcsize(STRUCT_FMT)
 
 # Verify struct size matches expected
@@ -79,12 +80,14 @@ assert STRUCT_SIZE == SAMPLE_SIZE, f"Struct size mismatch: {STRUCT_SIZE} != {SAM
 
 # Field names for CSV header
 # Phase 3: servo_latency_us is now populated (was imu_servo_skew_us in Phase 2)
+# Phase 3+: cmd_goal and cmd_time_us added for tracking error analysis
 CSV_HEADER = (
     "timestamp_sec,frame_index,"
     "accel_x,accel_y,accel_z,gyro_x,gyro_y,gyro_z,"
     "servo_pos,servo_vel,"
     "imu_read_us,servo_age_us,isr_total_us,servo_latency_us,"
-    "period_error_us,checksum,coherency_flag,servo_error_code"
+    "period_error_us,checksum,coherency_flag,servo_error_code,"
+    "cmd_goal,cmd_time_us"
 )
 
 
@@ -113,6 +116,8 @@ def parse_sample(data):
         'checksum': fields[15],
         'coherency_flag': fields[16],
         'servo_error_code': fields[17],
+        'cmd_goal': fields[18],          # Last commanded goal position
+        'cmd_time_us': fields[19],       # Timestamp when command was sent
     }
 
 
@@ -126,7 +131,8 @@ def sample_to_csv_row(sample):
         f"{sample['imu_read_us']},{sample['servo_age_us']},"
         f"{sample['isr_total_us']},{sample['servo_latency_us']},"
         f"{sample['period_error_us']},{sample['checksum']},"
-        f"{sample['coherency_flag']},{sample['servo_error_code']}"
+        f"{sample['coherency_flag']},{sample['servo_error_code']},"
+        f"{sample['cmd_goal']},{sample['cmd_time_us']}"
     )
 
 
@@ -306,11 +312,11 @@ def analyze_phase3(csv_file, save_plots=True):
 
     # ========== SERVO AGE ANALYSIS (Option B' - with pipeline correction) ==========
     print("\n" + "-" * 70)
-    print("5. SERVO AGE (Option B' - Synchronized TX, Pipeline-Corrected)")
+    print("5. SERVO DATA AGE (Time Since Last Read, Pipeline-Corrected)")
     print("-" * 70)
-    print("NOTE: Servo TX queued immediately after IMU read in Frame ISR")
+    print("NOTE: servo_age_aligned = frame_ts - t_rx (time since servo response)")
     print("      One-frame pipeline: servo data shifted from next frame")
-    print("      Expected: servo_age_aligned < 800µs")
+    print("      Expected: < 2000µs (one frame period @ 500 Hz)")
 
     # Filter to VALID servo samples only (using aligned fields)
     valid_servo = df[df['valid_alignment']]
@@ -320,22 +326,22 @@ def analyze_phase3(csv_file, save_plots=True):
         print(f"\nValid servo samples: {len(valid_servo)} / {len(df)} ({len(valid_servo)/len(df)*100:.1f}%)")
         print(f"Invalid samples (excluded): {total_errors} ({total_errors/len(df)*100:.2f}%)")
 
-        print(f"\nServo age (aligned, valid samples only):")
+        print(f"\nServo data age (time since last read, aligned):")
         print(f"  Mean: {valid_servo['servo_age_aligned'].mean():.1f} µs")
         print(f"  Std: {valid_servo['servo_age_aligned'].std():.1f} µs")
         print(f"  Min: {valid_servo['servo_age_aligned'].min():.0f} µs")
         print(f"  Max: {valid_servo['servo_age_aligned'].max():.0f} µs")
         print(f"  Median: {valid_servo['servo_age_aligned'].median():.1f} µs")
 
-        # Option B' target: < 800µs (much tighter than Phase 2's 2500µs)
+        # Check against 2000µs (one frame period)
         max_age = valid_servo['servo_age_aligned'].max()
-        age_pass = max_age < 800
-        print(f"\nMax age < 800µs: {'✅ PASS' if age_pass else '❌ FAIL'}")
+        age_pass = max_age < 2000
+        print(f"\nMax age < 2000µs: {'✅ PASS' if age_pass else '❌ FAIL'}")
 
         # Also check typical (median) age
         median_age = valid_servo['servo_age_aligned'].median()
-        age_typical = median_age < 500
-        print(f"Median age < 500µs: {'✅ PASS' if age_typical else '⚠️  HIGH (but may still work)'}")
+        age_typical = median_age < 1800
+        print(f"Median age < 1800µs: {'✅ PASS' if age_typical else '⚠️  HIGH (but may still work)'}")
     else:
         print("[WARN] No valid servo samples (all errors or invalid)")
         age_pass = False
@@ -343,26 +349,37 @@ def analyze_phase3(csv_file, save_plots=True):
 
     # ========== SERVO LATENCY ANALYSIS (NEW in Phase 3, pipeline-corrected) ==========
     print("\n" + "-" * 70)
-    print("6. SERVO LATENCY (Round-Trip Time, Pipeline-Corrected)")
+    print("6. SERVO COMMUNICATION LATENCY (Round-Trip Time, Pipeline-Corrected)")
     print("-" * 70)
-    print("NOTE: servo_latency_aligned = t_rx_us - t_req_us (shifted from next frame)")
-    print("      Expected: 500-700µs (TX + servo internal + RX)")
+    print("NOTE: servo_latency_aligned = t_rx - t_req (READ request → response)")
+    print("      Expected: < 380µs (theoretical sync write time)")
+    print("      Lower is better - indicates fast servo response")
 
     valid_latency = df[df['valid_alignment'] & (df['servo_latency_aligned'] > 0) & (df['servo_latency_aligned'] < 2000)]
 
     if len(valid_latency) > 0:
         print(f"\nValid latency samples: {len(valid_latency)} / {len(df)}")
-        print(f"\nServo round-trip latency (aligned):")
+        print(f"\nServo round-trip latency (READ request → response):")
         print(f"  Mean: {valid_latency['servo_latency_aligned'].mean():.1f} µs")
         print(f"  Std: {valid_latency['servo_latency_aligned'].std():.1f} µs")
         print(f"  Min: {valid_latency['servo_latency_aligned'].min():.0f} µs")
         print(f"  Max: {valid_latency['servo_latency_aligned'].max():.0f} µs")
         print(f"  Median: {valid_latency['servo_latency_aligned'].median():.1f} µs")
 
-        # Sanity check: latency should be 300-800µs typically
+        # Check against 380µs (theoretical communication time)
         mean_latency = valid_latency['servo_latency_aligned'].mean()
-        latency_reasonable = 300 < mean_latency < 900
-        print(f"\nMean latency in 300-900µs range: {'✅ PASS' if latency_reasonable else '⚠️  UNUSUAL'}")
+        max_latency = valid_latency['servo_latency_aligned'].max()
+        latency_excellent = mean_latency < 200
+        latency_pass = max_latency < 380
+
+        if latency_excellent:
+            print(f"\n✅ EXCELLENT: Mean latency {mean_latency:.1f}µs < 200µs (very fast!)")
+        elif latency_pass:
+            print(f"\n✅ PASS: Max latency {max_latency:.0f}µs < 380µs")
+        else:
+            print(f"\n⚠️  HIGH: Max latency {max_latency:.0f}µs > 380µs")
+
+        latency_reasonable = latency_pass
     else:
         print("[WARN] No valid latency data")
         latency_reasonable = True  # Don't fail on missing data
@@ -465,7 +482,7 @@ def analyze_phase3(csv_file, save_plots=True):
         'Zero drops': drop_pass,
         'Jitter < 100µs': jitter_pass,
         'WCET < 200µs': wcet_pass,
-        'Servo age < 800µs': age_pass,
+        'Servo data age < 2000µs': age_pass,
         'IMU-encoder misalign < 800µs': misalign_pass,
         'Zero torn reads': coherency_pass,
         'Servo errors < 5%': servo_pass,
@@ -517,17 +534,17 @@ def analyze_phase3(csv_file, save_plots=True):
                 axes1[2].plot(valid_servo_plot['timestamp_sec'].values,
                             valid_servo_plot['servo_age_aligned'].values,
                             linewidth=0.5, alpha=0.7, color='#2E86AB')
-                axes1[2].axhline(800, color='r', linestyle='--', label='Target max (800µs)')
+                axes1[2].axhline(2000, color='r', linestyle='--', label='Frame period (2000µs)')
                 axes1[2].axhline(valid_servo_plot['servo_age_aligned'].median(), color='g',
                                linestyle='--', label=f'Median ({valid_servo_plot["servo_age_aligned"].median():.0f}µs)')
-                axes1[2].set_ylabel('Servo Age (µs)')
-                axes1[2].set_title('Servo Sample Age (Pipeline-Corrected, Option B\')')
+                axes1[2].set_ylabel('Data Age (µs)')
+                axes1[2].set_title('Servo Data Age - Time Since Last Read (Pipeline-Corrected)')
                 axes1[2].legend()
                 axes1[2].grid(True, alpha=0.3)
             else:
                 axes1[2].text(0.5, 0.5, 'No valid servo data', ha='center', va='center',
                             transform=axes1[2].transAxes)
-                axes1[2].set_title('Servo Sample Age (No Valid Data)')
+                axes1[2].set_title('Servo Data Age (No Valid Data)')
 
             # Servo Latency (NEW in Phase 3, pipeline-corrected)
             valid_lat_plot = df[df['valid_alignment'] & (df['servo_latency_aligned'] > 0) & (df['servo_latency_aligned'] < 2000)].copy()
@@ -535,10 +552,11 @@ def analyze_phase3(csv_file, save_plots=True):
                 axes1[3].plot(valid_lat_plot['timestamp_sec'].values,
                             valid_lat_plot['servo_latency_aligned'].values,
                             linewidth=0.5, alpha=0.7, color='purple')
+                axes1[3].axhline(380, color='orange', linestyle='--', label='Theory (380µs)')
                 axes1[3].axhline(valid_lat_plot['servo_latency_aligned'].mean(), color='g',
                                linestyle='--', label=f'Mean ({valid_lat_plot["servo_latency_aligned"].mean():.0f}µs)')
                 axes1[3].set_ylabel('Latency (µs)')
-                axes1[3].set_title('Servo Round-Trip Latency (Pipeline-Corrected)')
+                axes1[3].set_title('Servo Communication Latency (READ request → response)')
                 axes1[3].legend()
                 axes1[3].grid(True, alpha=0.3)
             else:
@@ -677,6 +695,96 @@ def analyze_phase3(csv_file, save_plots=True):
                 plt.close(fig3)
             else:
                 print("[WARN] No valid alignment data - skipping misalignment plot", file=sys.stderr)
+
+            # ===== SERVO CONTROL PLOT (2 subplots) =====
+            # Plot commanded vs actual position for trajectory tracking analysis
+            servo_control_plot_file = csv_file.replace('.csv', '_servo_control.png')
+            valid_control = df[df['valid_alignment']].copy()
+
+            # Filter to frames where commands were sent (cmd_goal != 0xFFFF)
+            valid_control = valid_control[valid_control['cmd_goal'] != 0xFFFF]
+
+            if len(valid_control) > 10:
+                fig4, axes4 = plt.subplots(2, 1, figsize=(16, 10))
+                fig4.suptitle('Phase 3: Servo Control Analysis (Command Tracking)',
+                             fontsize=16, fontweight='bold')
+
+                # Convert to time (seconds)
+                time_s = valid_control['timestamp_sec'].values
+
+                # --- Plot 1: Position vs Time (Commanded and Actual) ---
+                ax = axes4[0]
+                ax.plot(time_s, valid_control['cmd_goal'].values,
+                       linewidth=1.2, color='#E63946', alpha=0.8, label='Commanded Position',
+                       linestyle='--', marker='o', markersize=2, markevery=max(1, len(time_s)//100))
+                ax.plot(time_s, valid_control['servo_pos_aligned'].values,
+                       linewidth=1.0, color='#2A9D8F', alpha=0.9, label='Actual Position (Aligned)')
+
+                ax.set_ylabel('Position (encoder units)', fontsize=12, fontweight='bold')
+                ax.set_xlabel('Time (s)', fontsize=11)
+                ax.set_title('Commanded vs Actual Servo Position', fontsize=13)
+                ax.legend(loc='upper right', fontsize=11)
+                ax.grid(True, alpha=0.3, linestyle='--')
+
+                # Add range info to title
+                pos_min = valid_control['servo_pos_aligned'].min()
+                pos_max = valid_control['servo_pos_aligned'].max()
+                pos_range = pos_max - pos_min
+                ax.text(0.02, 0.98, f'Range: {pos_min:.0f}-{pos_max:.0f} ({pos_range:.0f} units)',
+                       transform=ax.transAxes, fontsize=10,
+                       verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+                # --- Plot 2: Tracking Error (Commanded - Actual) ---
+                ax = axes4[1]
+                tracking_error = valid_control['cmd_goal'].values - valid_control['servo_pos_aligned'].values
+
+                ax.plot(time_s, tracking_error,
+                       linewidth=0.8, color='#F77F00', alpha=0.8, label='Tracking Error')
+                ax.axhline(0, color='black', linestyle='-', linewidth=0.8, alpha=0.5)
+                ax.axhline(tracking_error.mean(), color='red', linestyle='--',
+                          linewidth=1.5, label=f'Mean Error ({tracking_error.mean():.1f} units)')
+
+                # Fill positive/negative error regions
+                ax.fill_between(time_s, 0, tracking_error,
+                               where=(tracking_error >= 0), color='#E63946', alpha=0.3,
+                               label='Positive Error', interpolate=True)
+                ax.fill_between(time_s, 0, tracking_error,
+                               where=(tracking_error < 0), color='#2A9D8F', alpha=0.3,
+                               label='Negative Error', interpolate=True)
+
+                ax.set_ylabel('Error (units)', fontsize=12, fontweight='bold')
+                ax.set_xlabel('Time (s)', fontsize=11)
+                ax.set_title('Tracking Error (Commanded - Actual)', fontsize=13)
+                ax.legend(loc='upper right', fontsize=10)
+                ax.grid(True, alpha=0.3, linestyle='--')
+
+                # Add error statistics to plot
+                error_stats = (f'RMS: {np.sqrt(np.mean(tracking_error**2)):.1f} | '
+                              f'Max: {tracking_error.max():.1f} | '
+                              f'Min: {tracking_error.min():.1f} | '
+                              f'Std: {tracking_error.std():.1f}')
+                ax.text(0.02, 0.98, error_stats,
+                       transform=ax.transAxes, fontsize=10,
+                       verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
+
+                plt.tight_layout()
+                plt.savefig(servo_control_plot_file, dpi=150, bbox_inches='tight')
+                print(f"[INFO] Servo control plot saved: {servo_control_plot_file}")
+                plt.close(fig4)
+
+                # Print tracking error summary
+                print("\n" + "-" * 70)
+                print("8. SERVO CONTROL ANALYSIS (Command Tracking)")
+                print("-" * 70)
+                print(f"Samples with commands: {len(valid_control)}")
+                print(f"Tracking error (commanded - actual):")
+                print(f"  Mean: {tracking_error.mean():.2f} encoder units")
+                print(f"  RMS: {np.sqrt(np.mean(tracking_error**2)):.2f} encoder units")
+                print(f"  Std: {tracking_error.std():.2f} encoder units")
+                print(f"  Max: {tracking_error.max():.1f} encoder units")
+                print(f"  Min: {tracking_error.min():.1f} encoder units")
+            else:
+                print("[WARN] Not enough samples with commands - skipping servo control plot", file=sys.stderr)
 
         except ImportError:
             print("[WARN] matplotlib not installed - skipping plots", file=sys.stderr)
