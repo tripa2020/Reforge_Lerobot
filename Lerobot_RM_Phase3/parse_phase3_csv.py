@@ -134,30 +134,62 @@ def sample_to_csv_row(sample):
 
 def align_servo_to_imu(df):
     """
-    Fix one-frame pipeline delay: servo_position in row k came from frame k-1.
+    Fix one-frame pipeline delay: servo data in row k came from frame k-1.
 
     In Option B' architecture:
       - Frame ISR reads IMU at t_k, then queues servo TX
       - Servo response arrives before next frame
       - Frame k+1 snapshots the servo state (which is from the k request)
 
-    This means each row's servo_pos is actually ONE CYCLE OLD relative to
+    This means each row's servo data is actually ONE CYCLE OLD relative to
     the IMU data in that same row. Naively treating "same row = same time"
     injects a systematic 2ms phase error into training data.
 
-    Solution: Shift servo data forward by 1 row to align with correct IMU frame.
+    Solution: Shift ALL servo data forward by 1 row to align with correct IMU frame.
+    This includes position AND timing fields (servo_age_us, servo_latency_us).
+
+    Key Insight:
+      For frame k, to compute IMU-encoder misalignment:
+        - IMU was sampled at frame_ts_us[k]
+        - Servo READ was requested at ~frame_ts_us[k] + 50µs
+        - Servo response arrives by frame k+1
+        - Use servo_age_us[k+1] and servo_latency_us[k+1] to compute misalignment
+
+    Misalignment formula:
+      t_encoder ≈ t_imu - (FRAME_PERIOD - servo_age_next - servo_latency_next/2)
+
+    Simplified (magnitude):
+      misalignment ≈ FRAME_PERIOD - servo_age_next - servo_latency_next/2
 
     Args:
-        df: DataFrame with servo_pos column
+        df: DataFrame with servo fields
 
     Returns:
-        DataFrame with servo_pos_aligned column, last row dropped
+        DataFrame with aligned servo fields (_aligned suffix), last row dropped
     """
-    # Shift servo forward by 1 row (servo in row k belongs with IMU in row k+1)
+    # Shift ALL servo data from next frame (k+1) to align with IMU from current frame (k)
     df['servo_pos_aligned'] = df['servo_pos'].shift(-1)
+    df['servo_age_aligned'] = df['servo_age_us'].shift(-1)
+    df['servo_latency_aligned'] = df['servo_latency_us'].shift(-1)
+    df['servo_error_aligned'] = df['servo_error_code'].shift(-1)
 
     # Drop last row (has NaN servo after shift)
     df = df.iloc[:-1].reset_index(drop=True)
+
+    # Calculate IMU-encoder temporal misalignment using aligned timing
+    FRAME_PERIOD_US = 2000.0  # 500 Hz
+    df['imu_encoder_misalign_us'] = (
+        FRAME_PERIOD_US
+        - df['servo_age_aligned']
+        - 0.5 * df['servo_latency_aligned']
+    )
+
+    # Mark valid alignment samples (servo had no errors and data is valid)
+    df['valid_alignment'] = (
+        (df['servo_error_aligned'] == 0) &
+        (df['servo_pos_aligned'] >= 0) &
+        (df['servo_age_aligned'] != 0xFFFF)
+    )
 
     return df
 
@@ -272,63 +304,63 @@ def analyze_phase3(csv_file, save_plots=True):
     wcet_pass = df['isr_total_us'].max() < 200  # Tighter budget for Option B'
     print(f"WCET < 200µs: {'✅ PASS' if wcet_pass else '❌ FAIL'}")
 
-    # ========== SERVO AGE ANALYSIS (Option B') ==========
+    # ========== SERVO AGE ANALYSIS (Option B' - with pipeline correction) ==========
     print("\n" + "-" * 70)
-    print("5. SERVO AGE (Option B' - Synchronized TX)")
+    print("5. SERVO AGE (Option B' - Synchronized TX, Pipeline-Corrected)")
     print("-" * 70)
     print("NOTE: Servo TX queued immediately after IMU read in Frame ISR")
-    print("      Expected: servo_age_us = frame_ts_us - t_rx_us < 800µs")
-    print("      This is the one-cycle pipeline delay (ask in N, know in N+1)")
+    print("      One-frame pipeline: servo data shifted from next frame")
+    print("      Expected: servo_age_aligned < 800µs")
 
-    # Filter to VALID servo samples only
-    valid_servo = df[(df['servo_error_code'] == 0) & (df['servo_age_us'] != 0xFFFF)]
-    total_errors = (df['servo_error_code'] != 0).sum()
+    # Filter to VALID servo samples only (using aligned fields)
+    valid_servo = df[df['valid_alignment']]
+    total_errors = (~df['valid_alignment']).sum()
 
     if len(valid_servo) > 0:
         print(f"\nValid servo samples: {len(valid_servo)} / {len(df)} ({len(valid_servo)/len(df)*100:.1f}%)")
-        print(f"Error samples (excluded): {total_errors} ({total_errors/len(df)*100:.2f}%)")
+        print(f"Invalid samples (excluded): {total_errors} ({total_errors/len(df)*100:.2f}%)")
 
-        print(f"\nServo age (valid samples only):")
-        print(f"  Mean: {valid_servo['servo_age_us'].mean():.1f} µs")
-        print(f"  Std: {valid_servo['servo_age_us'].std():.1f} µs")
-        print(f"  Min: {valid_servo['servo_age_us'].min()} µs")
-        print(f"  Max: {valid_servo['servo_age_us'].max()} µs")
-        print(f"  Median: {valid_servo['servo_age_us'].median():.1f} µs")
+        print(f"\nServo age (aligned, valid samples only):")
+        print(f"  Mean: {valid_servo['servo_age_aligned'].mean():.1f} µs")
+        print(f"  Std: {valid_servo['servo_age_aligned'].std():.1f} µs")
+        print(f"  Min: {valid_servo['servo_age_aligned'].min():.0f} µs")
+        print(f"  Max: {valid_servo['servo_age_aligned'].max():.0f} µs")
+        print(f"  Median: {valid_servo['servo_age_aligned'].median():.1f} µs")
 
         # Option B' target: < 800µs (much tighter than Phase 2's 2500µs)
-        max_age = valid_servo['servo_age_us'].max()
+        max_age = valid_servo['servo_age_aligned'].max()
         age_pass = max_age < 800
         print(f"\nMax age < 800µs: {'✅ PASS' if age_pass else '❌ FAIL'}")
 
         # Also check typical (median) age
-        median_age = valid_servo['servo_age_us'].median()
+        median_age = valid_servo['servo_age_aligned'].median()
         age_typical = median_age < 500
         print(f"Median age < 500µs: {'✅ PASS' if age_typical else '⚠️  HIGH (but may still work)'}")
     else:
-        print("[WARN] No valid servo samples (all errors or 0xFFFF)")
+        print("[WARN] No valid servo samples (all errors or invalid)")
         age_pass = False
         age_typical = False
 
-    # ========== SERVO LATENCY ANALYSIS (NEW in Phase 3) ==========
+    # ========== SERVO LATENCY ANALYSIS (NEW in Phase 3, pipeline-corrected) ==========
     print("\n" + "-" * 70)
-    print("6. SERVO LATENCY (Round-Trip Time)")
+    print("6. SERVO LATENCY (Round-Trip Time, Pipeline-Corrected)")
     print("-" * 70)
-    print("NOTE: servo_latency_us = t_rx_us - t_req_us")
+    print("NOTE: servo_latency_aligned = t_rx_us - t_req_us (shifted from next frame)")
     print("      Expected: 500-700µs (TX + servo internal + RX)")
 
-    valid_latency = df[(df['servo_error_code'] == 0) & (df['servo_latency_us'] > 0) & (df['servo_latency_us'] < 2000)]
+    valid_latency = df[df['valid_alignment'] & (df['servo_latency_aligned'] > 0) & (df['servo_latency_aligned'] < 2000)]
 
     if len(valid_latency) > 0:
         print(f"\nValid latency samples: {len(valid_latency)} / {len(df)}")
-        print(f"\nServo round-trip latency:")
-        print(f"  Mean: {valid_latency['servo_latency_us'].mean():.1f} µs")
-        print(f"  Std: {valid_latency['servo_latency_us'].std():.1f} µs")
-        print(f"  Min: {valid_latency['servo_latency_us'].min()} µs")
-        print(f"  Max: {valid_latency['servo_latency_us'].max()} µs")
-        print(f"  Median: {valid_latency['servo_latency_us'].median():.1f} µs")
+        print(f"\nServo round-trip latency (aligned):")
+        print(f"  Mean: {valid_latency['servo_latency_aligned'].mean():.1f} µs")
+        print(f"  Std: {valid_latency['servo_latency_aligned'].std():.1f} µs")
+        print(f"  Min: {valid_latency['servo_latency_aligned'].min():.0f} µs")
+        print(f"  Max: {valid_latency['servo_latency_aligned'].max():.0f} µs")
+        print(f"  Median: {valid_latency['servo_latency_aligned'].median():.1f} µs")
 
         # Sanity check: latency should be 300-800µs typically
-        mean_latency = valid_latency['servo_latency_us'].mean()
+        mean_latency = valid_latency['servo_latency_aligned'].mean()
         latency_reasonable = 300 < mean_latency < 900
         print(f"\nMean latency in 300-900µs range: {'✅ PASS' if latency_reasonable else '⚠️  UNUSUAL'}")
     else:
@@ -351,17 +383,54 @@ def analyze_phase3(csv_file, save_plots=True):
     coherency_pass = torn == 0
     print(f"\nZero torn reads: {'✅ PASS' if coherency_pass else '❌ FAIL'}")
 
+    # ========== IMU-ENCODER MISALIGNMENT (Option B' Key Metric) ==========
+    print("\n" + "-" * 70)
+    print("7. IMU-ENCODER TEMPORAL MISALIGNMENT (Pipeline-Corrected)")
+    print("-" * 70)
+    print("NOTE: Misalignment = FRAME_PERIOD - servo_age_aligned - 0.5*servo_latency_aligned")
+    print("      Target: < 800µs (LeRobot requirement)")
+
+    valid_misalign = df[df['valid_alignment']]
+
+    if len(valid_misalign) > 0:
+        print(f"\nValid alignment samples: {len(valid_misalign)} / {len(df)}")
+        print(f"\nIMU-Encoder Misalignment:")
+        print(f"  Mean: {valid_misalign['imu_encoder_misalign_us'].mean():.1f} µs")
+        print(f"  Std: {valid_misalign['imu_encoder_misalign_us'].std():.1f} µs")
+        print(f"  Min: {valid_misalign['imu_encoder_misalign_us'].min():.1f} µs")
+        print(f"  Max: {valid_misalign['imu_encoder_misalign_us'].max():.1f} µs")
+        print(f"  Median: {valid_misalign['imu_encoder_misalign_us'].median():.1f} µs")
+
+        # Critical check: < 800µs
+        max_misalign = valid_misalign['imu_encoder_misalign_us'].max()
+        misalign_pass = max_misalign < 800
+        over_threshold = valid_misalign[valid_misalign['imu_encoder_misalign_us'] > 800]
+
+        if misalign_pass:
+            print(f"\n✅ PASS: All {len(valid_misalign)} frames < 800µs")
+            print(f"   Max misalignment: {max_misalign:.1f} µs")
+            print(f"   Margin: {800 - max_misalign:.1f} µs")
+        else:
+            print(f"\n❌ FAIL: {len(over_threshold)}/{len(valid_misalign)} frames > 800µs")
+            print(f"   Worst: {max_misalign:.1f} µs")
+            print(f"   Overshoot: {max_misalign - 800:.1f} µs")
+    else:
+        print("[WARN] No valid alignment data")
+        misalign_pass = False
+
     # ========== SERVO ERRORS ==========
     print("\n" + "-" * 70)
     print("8. SERVO COMMUNICATION")
     print("-" * 70)
 
-    servo_errors = (df['servo_error_code'] != 0).sum()
+    # Use aligned error field for accuracy
+    servo_errors = (~df['valid_alignment']).sum()
+    # For detailed breakdown, use original error codes (not shifted)
     servo_timeouts = (df['servo_error_code'] == 1).sum()
     servo_checksum = (df['servo_error_code'] == 2).sum()
     servo_framing = (df['servo_error_code'] == 3).sum()
 
-    print(f"Total errors: {servo_errors} / {len(df)} ({servo_errors/len(df)*100:.2f}%)")
+    print(f"Total errors/invalid: {servo_errors} / {len(df)} ({servo_errors/len(df)*100:.2f}%)")
     print(f"  Timeouts (1): {servo_timeouts}")
     print(f"  Checksum (2): {servo_checksum}")
     print(f"  Framing (3): {servo_framing}")
@@ -389,7 +458,7 @@ def analyze_phase3(csv_file, save_plots=True):
     print("=" * 70)
 
     all_pass = (rate_pass and drop_pass and jitter_pass and wcet_pass and
-                age_pass and coherency_pass and servo_pass and imu_fast)
+                age_pass and misalign_pass and coherency_pass and servo_pass and imu_fast)
 
     results = {
         'Sample rate 490-510 Hz': rate_pass,
@@ -397,6 +466,7 @@ def analyze_phase3(csv_file, save_plots=True):
         'Jitter < 100µs': jitter_pass,
         'WCET < 200µs': wcet_pass,
         'Servo age < 800µs': age_pass,
+        'IMU-encoder misalign < 800µs': misalign_pass,
         'Zero torn reads': coherency_pass,
         'Servo errors < 5%': servo_pass,
         'IMU read < 100µs': imu_fast,
@@ -441,17 +511,17 @@ def analyze_phase3(csv_file, save_plots=True):
             axes1[1].legend()
             axes1[1].grid(True, alpha=0.3)
 
-            # Servo Age (Option B' - tight synchronization)
-            valid_servo_plot = df[df['servo_age_us'] != 0xFFFF].copy()
+            # Servo Age (Option B' - pipeline-corrected)
+            valid_servo_plot = df[df['valid_alignment']].copy()
             if len(valid_servo_plot) > 0:
                 axes1[2].plot(valid_servo_plot['timestamp_sec'].values,
-                            valid_servo_plot['servo_age_us'].values,
-                            linewidth=0.5, alpha=0.7)
+                            valid_servo_plot['servo_age_aligned'].values,
+                            linewidth=0.5, alpha=0.7, color='#2E86AB')
                 axes1[2].axhline(800, color='r', linestyle='--', label='Target max (800µs)')
-                axes1[2].axhline(valid_servo_plot['servo_age_us'].median(), color='g',
-                               linestyle='--', label=f'Median ({valid_servo_plot["servo_age_us"].median():.0f}µs)')
+                axes1[2].axhline(valid_servo_plot['servo_age_aligned'].median(), color='g',
+                               linestyle='--', label=f'Median ({valid_servo_plot["servo_age_aligned"].median():.0f}µs)')
                 axes1[2].set_ylabel('Servo Age (µs)')
-                axes1[2].set_title('Servo Sample Age (Option B\' - Target: <800µs)')
+                axes1[2].set_title('Servo Sample Age (Pipeline-Corrected, Option B\')')
                 axes1[2].legend()
                 axes1[2].grid(True, alpha=0.3)
             else:
@@ -459,16 +529,16 @@ def analyze_phase3(csv_file, save_plots=True):
                             transform=axes1[2].transAxes)
                 axes1[2].set_title('Servo Sample Age (No Valid Data)')
 
-            # Servo Latency (NEW in Phase 3)
-            valid_lat_plot = df[(df['servo_latency_us'] > 0) & (df['servo_latency_us'] < 2000)].copy()
+            # Servo Latency (NEW in Phase 3, pipeline-corrected)
+            valid_lat_plot = df[df['valid_alignment'] & (df['servo_latency_aligned'] > 0) & (df['servo_latency_aligned'] < 2000)].copy()
             if len(valid_lat_plot) > 0:
                 axes1[3].plot(valid_lat_plot['timestamp_sec'].values,
-                            valid_lat_plot['servo_latency_us'].values,
+                            valid_lat_plot['servo_latency_aligned'].values,
                             linewidth=0.5, alpha=0.7, color='purple')
-                axes1[3].axhline(valid_lat_plot['servo_latency_us'].mean(), color='g',
-                               linestyle='--', label=f'Mean ({valid_lat_plot["servo_latency_us"].mean():.0f}µs)')
+                axes1[3].axhline(valid_lat_plot['servo_latency_aligned'].mean(), color='g',
+                               linestyle='--', label=f'Mean ({valid_lat_plot["servo_latency_aligned"].mean():.0f}µs)')
                 axes1[3].set_ylabel('Latency (µs)')
-                axes1[3].set_title('Servo Round-Trip Latency (t_rx - t_req)')
+                axes1[3].set_title('Servo Round-Trip Latency (Pipeline-Corrected)')
                 axes1[3].legend()
                 axes1[3].grid(True, alpha=0.3)
             else:
@@ -525,6 +595,88 @@ def analyze_phase3(csv_file, save_plots=True):
             plt.savefig(sensor_plot_file, dpi=150)
             print(f"[INFO] Sensor plots saved: {sensor_plot_file}")
             plt.close(fig2)
+
+            # ===== IMU-ENCODER MISALIGNMENT PLOT (3 subplots) =====
+            misalign_plot_file = csv_file.replace('.csv', '_IMU_encoder_misalignment.png')
+            valid_misalign_plot = df[df['valid_alignment']].copy()
+
+            if len(valid_misalign_plot) > 0:
+                fig3, axes3 = plt.subplots(3, 1, figsize=(14, 10))
+                fig3.suptitle('Phase 3: IMU-Encoder Alignment Analysis (Pipeline-Corrected)',
+                             fontsize=16, fontweight='bold')
+
+                # Convert frame indices to time (seconds)
+                time_s = valid_misalign_plot['timestamp_sec'].values
+
+                # --- Plot 1: Misalignment Time Series ---
+                ax = axes3[0]
+                ax.plot(time_s, valid_misalign_plot['imu_encoder_misalign_us'].values,
+                       linewidth=0.8, color='#2E86AB', alpha=0.8, label='Misalignment')
+                ax.axhline(800, color='red', linestyle='--',
+                          linewidth=2, label='Threshold (800 µs)')
+                ax.axhline(valid_misalign_plot['imu_encoder_misalign_us'].mean(), color='orange',
+                          linestyle=':', linewidth=1.5,
+                          label=f'Mean ({valid_misalign_plot["imu_encoder_misalign_us"].mean():.1f} µs)')
+
+                ax.fill_between(time_s, 0, valid_misalign_plot['imu_encoder_misalign_us'].values,
+                               color='#2E86AB', alpha=0.2)
+
+                ax.set_ylabel('Misalignment (µs)', fontsize=12, fontweight='bold')
+                ax.set_xlabel('Time (s)', fontsize=11)
+                ax.set_title('IMU-Encoder Temporal Misalignment\n' +
+                            r'$\Delta t \approx T_{period} - servo\_age_{aligned} - 0.5 \cdot servo\_latency_{aligned}$',
+                            fontsize=13)
+                ax.legend(loc='upper right', fontsize=10)
+                ax.grid(True, alpha=0.3, linestyle='--')
+                ax.set_ylim(0, max(800 * 1.2, valid_misalign_plot['imu_encoder_misalign_us'].max() * 1.1))
+
+                # --- Plot 2: Histogram ---
+                ax = axes3[1]
+                n, bins, patches = ax.hist(valid_misalign_plot['imu_encoder_misalign_us'].values,
+                                          bins=50, color='#A23B72', alpha=0.7, edgecolor='black')
+
+                # Color bars above threshold red
+                for i, patch in enumerate(patches):
+                    if bins[i] > 800:
+                        patch.set_facecolor('red')
+                        patch.set_alpha(0.9)
+
+                ax.axvline(800, color='red', linestyle='--',
+                          linewidth=2, label='Threshold (800 µs)')
+                ax.axvline(valid_misalign_plot['imu_encoder_misalign_us'].mean(), color='orange',
+                          linestyle=':', linewidth=2,
+                          label=f'Mean ({valid_misalign_plot["imu_encoder_misalign_us"].mean():.1f} µs)')
+                ax.axvline(valid_misalign_plot['imu_encoder_misalign_us'].median(), color='green',
+                          linestyle='-.', linewidth=1.5,
+                          label=f'Median ({valid_misalign_plot["imu_encoder_misalign_us"].median():.1f} µs)')
+
+                ax.set_xlabel('Misalignment (µs)', fontsize=12, fontweight='bold')
+                ax.set_ylabel('Count', fontsize=11)
+                ax.set_title(f'Distribution (n={len(valid_misalign_plot)})', fontsize=13)
+                ax.legend(loc='upper right', fontsize=10)
+                ax.grid(True, alpha=0.3, axis='y')
+
+                # --- Plot 3: Timing Components ---
+                ax = axes3[2]
+                ax.plot(time_s, valid_misalign_plot['servo_age_aligned'].values,
+                       linewidth=0.8, color='#F18F01', alpha=0.8, label='Servo Age (aligned)')
+                ax.plot(time_s, valid_misalign_plot['servo_latency_aligned'].values,
+                       linewidth=0.8, color='#6A4C93', alpha=0.8, label='Servo Latency (aligned)')
+                ax.plot(time_s, valid_misalign_plot['imu_read_us'].values,
+                       linewidth=0.8, color='#2D936C', alpha=0.8, label='IMU Read')
+
+                ax.set_ylabel('Time (µs)', fontsize=12, fontweight='bold')
+                ax.set_xlabel('Time (s)', fontsize=11)
+                ax.set_title('Timing Components (One-Frame Pipeline Corrected)', fontsize=13)
+                ax.legend(loc='upper right', fontsize=10)
+                ax.grid(True, alpha=0.3, linestyle='--')
+
+                plt.tight_layout()
+                plt.savefig(misalign_plot_file, dpi=150, bbox_inches='tight')
+                print(f"[INFO] IMU-encoder misalignment plot saved: {misalign_plot_file}")
+                plt.close(fig3)
+            else:
+                print("[WARN] No valid alignment data - skipping misalignment plot", file=sys.stderr)
 
         except ImportError:
             print("[WARN] matplotlib not installed - skipping plots", file=sys.stderr)

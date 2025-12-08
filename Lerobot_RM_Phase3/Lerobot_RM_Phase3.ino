@@ -36,7 +36,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include "ISM330_Bare.h"
-#include "uart3_driver.h"
+// NOTE: uart3_driver removed - using Serial3 directly (ISR attachment broken)
 
 // ARM Cortex-M7 Data Memory Barrier (for Seqlock synchronization)
 #if defined(__arm__) && defined(__IMXRT1062__)
@@ -156,16 +156,19 @@ struct ServoRxFSM {
 
 ServoRxFSM servo_rx = {RX_WAIT_HEADER1, {0}, 0, 0};
 
-// ============== SERVO READ STATE (Frame ISR triggers TX) ==============
-// Option B': Frame ISR fires servo TX immediately after IMU read
-// This achieves <800µs encoder-IMU alignment (instead of up to 2000µs decoupled)
+// ============== SERVO READ STATE (Frame ISR sets flag, main loop sends) ==============
+// Option B' with ISR-safe design:
+//   - Frame ISR sets request_queued flag (no Serial calls in ISR)
+//   - Main loop servo_read_service() sends READ when flag is set
+//   - Achieves <1ms encoder-IMU alignment (main loop latency typically <500µs)
 
 struct ServoReadState {
     volatile bool     request_in_flight;   // True if waiting for response
-    volatile uint32_t current_t_req_us;    // When frame ISR queued the last READ
+    volatile bool     request_queued;      // Frame ISR asked for a READ
+    volatile uint32_t current_t_req_us;    // When we *actually* sent READ
 };
 
-ServoReadState servo_read = {false, 0};
+ServoReadState servo_read = {false, false, 0};
 
 // ============== SERVO BUS MANAGER (for writes + timeout) ==============
 
@@ -262,8 +265,9 @@ IntervalTimer frameTimer;
 
 // ============== FORWARD DECLARATIONS ==============
 void frame_isr();
-void servo_timeout_service();  // Just handles timeout (TX is in frame_isr)
+void servo_timeout_service();
 void servo_protocol_fsm();
+void servo_read_service();     // Sends READ when frame_isr sets flag
 void servo_write_scheduler();
 void process_servo_frame(const uint8_t* buf, uint8_t len, uint32_t t_rx);
 uint8_t calculate_checksum(const uint8_t* data, uint8_t len);
@@ -273,6 +277,33 @@ void csv_push_sample(const CSVSample& sample);
 bool csv_buffer_full();
 void csv_service();
 void print_stats();
+
+// ============== SERVO TRANSPORT (Serial3-backed) ==============
+// Thin wrapper around Serial3 for servo communication.
+// NOTE: These are BLOCKING calls - servo_transport_write() blocks until TX complete.
+// For Phase 3 Option B', this is acceptable because:
+//   - Write is ~130µs for 8 bytes @ 1Mbaud
+//   - Called from frame_isr after IMU read
+//   - Total ISR time stays well under 500µs budget
+
+static inline uint8_t servo_transport_write(const uint8_t* data, uint8_t len) {
+    size_t written = Serial3.write(data, len);
+    Serial3.flush();  // Block until TX complete (required for half-duplex timing)
+    return (uint8_t)written;
+}
+
+static inline int servo_transport_read_byte() {
+    if (Serial3.available() > 0) {
+        return Serial3.read();
+    }
+    return -1;
+}
+
+static inline void servo_transport_flush_rx() {
+    while (Serial3.available() > 0) {
+        Serial3.read();
+    }
+}
 
 // ============== COMMAND QUEUE FUNCTIONS ==============
 
@@ -309,18 +340,35 @@ uint8_t calculate_checksum(const uint8_t* data, uint8_t len) {
 }
 
 // ============== SERVO READ REQUEST (Called from Frame ISR) ==============
-// Option B': Queue servo TX immediately after IMU read for tight synchronization
+// ISR-safe: just sets a flag, no Serial I/O
+// Actual TX happens in servo_read_service() in main loop
 
 bool queue_servo_read_request() {
-    // Don't send if already waiting for response
+    // Called from frame_isr() - must be ISR-safe (no Serial calls)
     if (servo_read.request_in_flight) {
-        return false;
+        return false;  // Still waiting on previous READ
     }
 
-    // Don't send if write is in progress
     if (servo_bus.state == BUS_WRITE_WAIT) {
-        return false;
+        return false;  // Don't collide with in-flight write
     }
+
+    servo_read.request_queued = true;
+    return true;
+}
+
+// ============== SERVO READ SERVICE (Called from Main Loop) ==============
+// Sends READ request when frame_isr sets request_queued flag
+
+void servo_read_service() {
+    // No READ requested by frame_isr this cycle
+    if (!servo_read.request_queued) return;
+
+    // Still waiting for response from previous READ
+    if (servo_read.request_in_flight) return;
+
+    // WRITE in progress - don't collide on half-duplex bus
+    if (servo_bus.state == BUS_WRITE_WAIT) return;
 
     // Build READ_POSITION request (8 bytes)
     uint8_t req[8];
@@ -333,23 +381,20 @@ bool queue_servo_read_request() {
     req[6] = 0x02;  // Read 2 bytes
     req[7] = calculate_checksum(req, 8);
 
-    // Queue to TX ring buffer (non-blocking, just fills ring)
-    uint8_t sent = uart3_send_bytes(req, 8);
+    uint8_t sent = servo_transport_write(req, 8);
     if (sent < 8) {
-        // TX buffer full (shouldn't happen)
-        return false;
+        // TX buffer full; leave request_queued = true, retry next loop
+        return;
     }
 
-    // Record timestamp and mark request in flight
     servo_read.current_t_req_us = micros();
     servo_read.request_in_flight = true;
+    servo_read.request_queued = false;
     servo_bus.state = BUS_READ_WAIT;
-
-    return true;
 }
 
 // ============== SERVO TIMEOUT SERVICE ==============
-// Handles timeout detection for both reads and writes (TX scheduling now in frame_isr)
+// Handles timeout detection for both reads and writes
 
 void servo_timeout_service() {
     uint32_t now_us = micros();
@@ -393,7 +438,7 @@ void servo_timeout_service() {
 void servo_protocol_fsm() {
     int byte;
 
-    while ((byte = uart3_get_byte()) >= 0) {
+    while ((byte = servo_transport_read_byte()) >= 0) {
         switch (servo_rx.state) {
 
         case RX_WAIT_HEADER1:
@@ -444,6 +489,14 @@ void servo_protocol_fsm() {
 // ============== PROCESS SERVO FRAME ==============
 
 void process_servo_frame(const uint8_t* buf, uint8_t len, uint32_t t_rx) {
+    // Check if this is a WRITE ACK (6 bytes, len field = 0x02)
+    // ACK format: FF FF ID 02 ERR CHECKSUM
+    // Just ignore it - don't update servo position, return to IDLE
+    if (len == 6 && buf[3] == 0x02) {
+        servo_bus.state = BUS_IDLE;
+        return;
+    }
+
     bool valid = true;
     uint8_t error_code = 0;
 
@@ -531,8 +584,8 @@ void servo_write_scheduler() {
     pkt[9] = (cmd.goal_speed >> 8) & 0xFF;
     pkt[10] = calculate_checksum(pkt, 11);
 
-    uart3_flush_rx();
-    uart3_send_bytes(pkt, 11);
+    servo_transport_flush_rx();
+    servo_transport_write(pkt, 11);
 
     servo_bus.write_request_sent_us = now_us;
     servo_bus.last_write_us = now_us;
@@ -765,12 +818,6 @@ void print_stats() {
     Serial.print("Framing: "); Serial.println(stats.servo_framing_errors);
     Serial.print("Resyncs: "); Serial.println(stats.servo_resync_count);
 
-    Serial.println("--- UART3 ---");
-    Serial.print("RX bytes: "); Serial.println(uart3_stats.rx_bytes);
-    Serial.print("TX bytes: "); Serial.println(uart3_stats.tx_bytes);
-    Serial.print("RX overflow: "); Serial.println(uart3_stats.rx_overflow);
-    Serial.print("ISR count: "); Serial.println(uart3_stats.isr_count);
-
     Serial.println("--- Command Queue ---");
     Serial.print("Overflows: "); Serial.println(stats.cmd_queue_overflows);
 
@@ -798,13 +845,11 @@ void setup() {
     Serial4.begin(SERIAL_CSV_BAUD);
     delay(100);  // Allow Serial4 hardware UART to initialize before handshake
 
-    // Custom UART3 driver (replaces Serial3)
-    uart3_init(SERVO_BAUD);
+    // Servo UART (Serial3 = LPUART2 on Teensy 4.1)
+    // NOTE: Using Teensyduino's Serial3 directly - custom ISR driver abandoned
+    Serial3.begin(SERVO_BAUD);
     #if ENABLE_DEBUG_OUTPUT
-    Serial.println("UART3 driver initialized @ 1 Mbaud");
-    Serial.println("  - 256-byte ring buffers");
-    Serial.println("  - FIFO depth = 1");
-    Serial.println("  - ISR priority = 64");
+    Serial.println("Serial3 initialized @ 1 Mbaud (native driver)");
     #endif
 
     // Initialize IMU
@@ -882,17 +927,20 @@ void setup() {
 
 void loop() {
     // ===== PRIORITY 0: Servo Protocol FSM (decode RX bytes) =====
-    // UART RX ISR pushed bytes into ring; FSM parses and updates latest_servo
+    // Serial3 RX ISR pushed bytes into buffer; FSM parses and updates latest_servo
     servo_protocol_fsm();
 
     // ===== PRIORITY 1: Servo Timeout Service =====
-    // TX scheduling is now in frame_isr; this just handles timeouts
     servo_timeout_service();
 
-    // ===== PRIORITY 2: Servo Write Scheduler (goal commands @ 40-100Hz) =====
+    // ===== PRIORITY 2: Servo Read Service (send READs requested by frame_isr) =====
+    // Frame ISR sets request_queued flag; this sends the actual READ packet
+    servo_read_service();
+
+    // ===== PRIORITY 3: Servo Write Scheduler (goal commands @ 40-100Hz) =====
     servo_write_scheduler();
 
-    // ===== PRIORITY 3: Telemetry =====
+    // ===== PRIORITY 4: Telemetry =====
     SensorData snapshot = seqlock_read();
 
     static uint32_t last_frame = UINT32_MAX;
@@ -903,7 +951,7 @@ void loop() {
 
     csv_service();
 
-    // ===== PRIORITY 4: User Commands =====
+    // ===== PRIORITY 5: User Commands =====
     if (Serial.available()) {
         char cmd = Serial.read();
         if (cmd == 's' || cmd == 'S') {
@@ -911,12 +959,12 @@ void loop() {
         }
     }
 
-    // ===== PRIORITY 5: Periodic Stats =====
+    // ===== PRIORITY 6: Periodic Stats =====
     #if ENABLE_DEBUG_OUTPUT
     print_stats();
     #endif
 
-    // ===== PRIORITY 6: Heartbeat LED =====
+    // ===== PRIORITY 7: Heartbeat LED =====
     static uint32_t last_blink = 0;
     uint32_t blink_interval = logging_active ? 100 : 500;
 
