@@ -93,7 +93,126 @@ Section 3 -> Steps to Replicate
 5. Press Ctrl + C to stop the test, and produce results 
 
 
+12/17/25 Update 
+---------------
+Section 1 -> Progress towards goal 
+- phase 5 is the new most current verison: full deffered interrupt pattern + State machine fucntionality for setting different data runs, moving mode 
+- Features:
+   - Move mode - blocking slow moving for going to different configurations
+   - Data mode - executes system ID sine sweep and data collection at 500hz
+Implemented the Teensy Hardware API, for interfacing with the teensy. Allows for communication abritiation on 2 serial ports(need to share the covalent_base-Lerobot_SO10-)
+- implement all fucntions in the Template Robot 
+- Final issue is IMU integration
+   - 1m long wires required: interferes with start up sequence, so ordered capicitors, and stablize the initial energy surge. should be here this weekend
 
 
+Section 2 -> architecture
+
+Teensy Serial Interface 
+┌─────────────────────────────────────────────────────────────────────┐
+│                     TeensySerialInterface                           │
+│                     (Facade / Public API)                           │
+│  • Radians-based joint control                                      │
+│  • Trajectory session management                                    │
+│                                                                     │  
+└──────────────┬──────────────────────────────────┬───────────────────┘
+               │                                  │
+               ▼                                  ▼
+┌──────────────────────────────┐    ┌─────────────────────────────────┐
+│         TeensyUSB            │    │     Serial4CaptureThread        │
+│     (Actor Pattern)          │    │     (Dedicated I/O Thread)      │
+│                              │    │                                 │
+│  • Queue-based command       │    │  • 500Hz binary frame capture   │
+│    serialization             │    │  • FTDI @ 2Mbaud                │
+│  • Single worker thread      │    │  • Raw .bin file output         │
+│  • Future-based responses    │    │  • Frame validation             │
+└──────────────┬───────────────┘    └─────────────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│   StreamingExclusiveGuard    │
+│   (Concurrency Policy)       │
+│                              │
+│  • Prevents concurrent USB   │
+│  • Whitelist for safe cmds   │
+│  • Thread ownership tracking │
+└──────────────────────────────┘
+
+Protocol
+--------
+| Command                  | Response                          | Purpose            |
+|--------------------------|-----------------------------------|--------------------|
+| PING                     | PONG,<mode>                       | Handshake, get mode|
+| MODE,MOVE                | MODE,MOVE,OK                      | Enter motion mode  |
+| MODE,DATA                | MODE,DATA,OK                      | Enter data mode    |
+| SYNCW,n,id,pos,spd,...   | OK                                | Multi-joint write  |
+| READJ                    | POS,p1,p2,p3,p4,p5,p6             | Read all joints    |
+| G,pos,speed              | (none)                            | Trajectory goal    |
+| RUN,START                | RUN,START,OK + EVT,LOGGING_ON     | Start ISR          |
+| RUN,STOP                 | RUN,STOP,OK + EVT,LOGGING_OFF     | Stop ISR           |
+
+interfaces with Lerobot_RM_Phase5/Lerobot_RM_Phase5.ino
+-------------------------------------------------------
+
+                    ┌─────────────┐
+                    │  MODE_WAIT  │  (Boot state, LED @ 1Hz)
+                    └──────┬──────┘
+                           │ MODE,MOVE or MODE,DATA
+              ┌────────────┴────────────┐
+              ▼                         ▼
+     ┌─────────────────┐      ┌─────────────────┐
+     │   MODE_MOVE     │      │ MODE_DATA_IDLE  │
+     │   (LED @ 4Hz)   │      │   (LED @ 2Hz)   │
+     │                 │      │                 │
+     │ • SYNCW command │      │ • No ISR yet    │
+     │ • READJ command │      │ • Waiting for   │
+     │ • Blocking I/O  │      │   RUN,START     │
+     └────────┬────────┘      └────────┬────────┘
+              │                        │ RUN,START
+              │                        ▼
+              │               ┌─────────────────┐
+              │               │ MODE_DATA_RUN   │
+              │               │  (LED @ 10Hz)   │
+              │               │                 │
+              │               │ • 500Hz ISR     │
+              │               │ • G commands    │
+              │               │ • Serial4 stream│
+              │               └────────┬────────┘
+              │                        │ RUN,STOP
+              │                        ▼
+              │               ┌─────────────────┐
+              │               │ MODE_DATA_IDLE  │
+              └───────────────┴─────────────────┘
+                     MODE,MOVE / MODE,DATA
+
+Section 3  -> Steps to Reproduce 
+--------------------------------
+1. Teensy_serial_interface 
+select which port it hooked up to the the FTDI and which is connected to usb serial 
+
+set in the module constructor 
+
+robot = TeensySerialInterface(
+    usb_port="/dev/ttyACM0",   # Teensy USB (commands)
+    ftdi_port="/dev/ttyUSB0"   # FTDI adapter (500Hz binary data)
+)
+
+2. Upload firmware: Lerobot_RM_Phase5.ino to teensy firmware 
+
+3. start the virtual env 
+cd /home/alex/Reforge/covalent-base-Lerobot_SO101/src
+python3 -m robots.teensy_serial_interface.test_interface
+
+| Command                       | Description                              |
+|-------------------------------|------------------------------------------|
+| r                             | Read joint positions + FK pose           |
+| m p1,p2,p3,p4,p5,p6 [speed]   | Move to joint positions (radians)        |
+| hm [speed]                    | Move to home position [0, π/2, -π/2, 0, 0, 0] |
+| ik x,y,z                      | Test inverse kinematics (no move)        |
+| mp x,y,z [speed]              | Move to Cartesian position via IK        |
+| L N                           | Sine sweep on axis N (1-5)               |
+| mode move                     | Ensure MOVE mode                         |
+| h                             | Help                                     |
+| q                             | Quit                                     |
 
 
