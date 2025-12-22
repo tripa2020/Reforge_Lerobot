@@ -420,7 +420,7 @@ void servo_read_service() {
     uint8_t req[8];
     req[0] = FEETECH_HEADER_1;
     req[1] = FEETECH_HEADER_2;
-    req[2] = SERVO_ID;
+    req[2] = g_stream_servo_id;
     req[3] = 0x04;  // Length
     req[4] = INSTR_READ_DATA;
     req[5] = REG_PRESENT_POSITION_L;
@@ -538,7 +538,7 @@ void process_servo_frame(const uint8_t* buf, uint8_t len, uint32_t t_rx) {
         error_code = 3;  // Framing
     }
 
-    if (valid && buf[2] != SERVO_ID) {
+    if (valid && buf[2] != g_stream_servo_id) {
         valid = false;
         error_code = 3;  // Wrong servo
     }

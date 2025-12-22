@@ -38,16 +38,21 @@ inline SPIClass*   g_spi      = nullptr;
 inline uint8_t     g_cs       = 10;
 inline SPISettings g_settings(4000000, MSBFIRST, SPI_MODE0); // MODE0, 4 MHz
 
-// ===== Low-level helpers (no Serial, no delay) =====
+// ===== Low-level helpers =====
+
+// CS setup/hold delay for long wires (PJRC recommends ~100Ω series for >25cm)
+inline void csDelay() { delayMicroseconds(1); }
 
 inline uint8_t readReg(uint8_t reg) {
     uint8_t v;
     g_spi->beginTransaction(g_settings);
     digitalWriteFast(g_cs, LOW);
+    csDelay();
 
     g_spi->transfer(reg | 0x80);   // MSB=1 → read
     v = g_spi->transfer(0x00);
 
+    csDelay();
     digitalWriteFast(g_cs, HIGH);
     g_spi->endTransaction();
     return v;
@@ -56,10 +61,12 @@ inline uint8_t readReg(uint8_t reg) {
 inline void writeReg(uint8_t reg, uint8_t value) {
     g_spi->beginTransaction(g_settings);
     digitalWriteFast(g_cs, LOW);
+    csDelay();
 
     g_spi->transfer(reg & 0x7F);   // MSB=0 → write
     g_spi->transfer(value);
 
+    csDelay();
     digitalWriteFast(g_cs, HIGH);
     g_spi->endTransaction();
 }
@@ -67,12 +74,14 @@ inline void writeReg(uint8_t reg, uint8_t value) {
 inline void readBurst(uint8_t startReg, uint8_t* buf, uint8_t len) {
     g_spi->beginTransaction(g_settings);
     digitalWriteFast(g_cs, LOW);
+    csDelay();
 
     g_spi->transfer(startReg | 0x80);  // read, IF_INC handles increment
     for (uint8_t i = 0; i < len; ++i) {
         buf[i] = g_spi->transfer(0x00);
     }
 
+    csDelay();
     digitalWriteFast(g_cs, HIGH);
     g_spi->endTransaction();
 }
@@ -97,6 +106,8 @@ inline bool init(const Config& cfg) {
     pinMode(g_cs, OUTPUT);
     digitalWriteFast(g_cs, HIGH);   // deselect
 
+    delay(10);  // Boot time after power-on
+
     // WHO_AM_I check
     uint8_t who = readReg(REG_WHO_AM_I);
     if (who != 0x6B) {              // expected 0x6B per datasheet
@@ -105,8 +116,15 @@ inline bool init(const Config& cfg) {
 
     // Software reset (SW_RESET=1)
     writeReg(REG_CTRL3_C, 0x01);
-    // give it time to clear; caller should delay(1) in setup()
-    // or poll SW_RESET bit if they care.
+
+    // Wait for reset to complete (poll SW_RESET bit or just delay)
+    delay(10);  // ISM330DHCX needs time after SW_RESET
+
+    // Verify WHO_AM_I again after reset
+    who = readReg(REG_WHO_AM_I);
+    if (who != 0x6B) {
+        return false;  // Reset may have failed
+    }
 
     // Re-write CTRL3_C: BDU=1, IF_INC=1
     writeReg(REG_CTRL3_C, 0x44);

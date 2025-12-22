@@ -43,7 +43,7 @@ void setup() {
     ISM330::Config cfg;
     cfg.spi    = &SPI;
     cfg.cs_pin = 10;
-    cfg.spi_hz = 4000000;
+    cfg.spi_hz = 400000;
 
     if (!ISM330::init(cfg)) {
         Serial.println("ISM330 init FAILED");
