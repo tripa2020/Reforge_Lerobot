@@ -225,6 +225,7 @@ python3 -m robots.teensy_serial_interface.test_interface
 - Ran the moveit setup assistant to generate a basic planning config for Lerobot_SO101
 - mother-fin SPI with long wires did not work
 -  so moved teensy to the end effector mount, and all systems are working, I tried all weekend, but I think moving the teensy to the end effector was the right move.
+- Now I need a little more time to Iron out the IK/FK sequence for what is need the in the TemplateRobot interface but super close.
 - Section 2 -> architecture
 
 ROS Bridge Module
@@ -280,6 +281,7 @@ Section 3  -> Steps to Reproduce
 --------------------------------
 
 this is where the setup get a little hard 
+I am not super experience used Github for colaboration, so I think the best move would be to add you as a colaborator, to the covalent-base-Lerobot_SO101 repo, so you can access all the files.
 I have 2 custom Ros Packages that I am made 
 1. Moveit setup assisant contains the urdf, kinematics, motion planning etc
 2. rosbridge_server to allow for web socket communication
@@ -292,3 +294,6 @@ roslaunch Reforge_LeRobot_moveit_config lerobot_ik.launch
 
 python3 -m robots.teensy_serial_interface.test_interface
 - runs the test interface that connects to the teensy and rosbridge to do IK/FK and trajectory planning
+
+for the Sine_sweep data collection current implemented with the commands specified last week, but the runs are stored in 
+src/calibration/runs
