@@ -274,8 +274,8 @@ ROS Bridge Module
 └──────────────┘   └────────────┘   └──────────────────┘
 ```
 
-this allows to call moveit for the IK/FK solution it is then compared with the work FK on this model loaded in the covalent base and then executed 
-- the trajectory is shown on RVIZ and you are prompted wether to exectute
+this allows to call moveit for the IK/FK solution it is then compared with the FK on the model loaded in the covalent base and then executed
+- the trajectory is shown on RVIZ and you are prompted wether to execute or not.
 
 Section 3  -> Steps to Reproduce
 --------------------------------
