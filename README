@@ -216,3 +216,79 @@ python3 -m robots.teensy_serial_interface.test_interface
 | q                             | Quit                                     |
 
 
+12/22/25 Update 
+---------------
+- Section 1 -> Progress towards goal 
+- Implement, RosBridgeManager to offload IK/FK and Trajectory planning to ROS MoveIt
+- Integrated into test_interface.py for testing 
+- Verified IK/FK solutions from MoveIt to match with covalent robot kinematics model 
+- Ran the moveit setup assistant to generate a basic planning config for Lerobot_SO101
+- mother-fin SPI with long wires did not work
+-  so moved teensy to the end effector mount, and all systems are working, I tried all weekend, but I think moving the teensy to the end effector was the right move.
+- Section 2 -> architecture
+
+ROS Bridge Module
+┌─────────────────────────────────────────────────────────────────────┐
+│                     ros_bridge Package                              │
+│                  (Non-ROS Python → MoveIt Services)                 │
+│                                                                     │
+│  • WebSocket-based ROS communication (no ROS install needed)        │
+│  • Persistent connection management                                 │
+│  • Position-only IK for 5-DOF arm                                   │
+│  • Trajectory planning & preview                                    │
+└──────────────┬──────────────────────────────────┬───────────────────┘
+               │                                  │
+               ▼                                  ▼
+┌──────────────────────────────┐    ┌─────────────────────────────────┐
+│    RosBridgeManager          │    │      MoveIt Services            │
+│  (Connection Lifecycle)      │    │   (via rosbridge WebSocket)     │
+│                              │    │                                 │
+│  • Persistent roslibpy.Ros   │    │  • /compute_ik                  │
+│    client (port 9090)        │    │    - TRAC-IK solver             │
+│  • Service proxy creation:   │    │    - position_only_ik: true     │
+│    - ik_service              │    │    - 0.5s timeout               │
+│    - fk_service              │    │  • /compute_fk                  │
+│    - planning_service        │    │    - Forward kinematics         │
+│  • Context manager support   │    │  • /plan_kinematic_path         │
+│  • Single connection for     │    │    - Motion planning            │
+│    entire session            │    │    - Collision avoidance        │
+└──────────────┬───────────────┘    └─────────────────────────────────┘
+               │
+       ┌───────┴────────┬──────────────────┐
+       ▼                ▼                   ▼
+┌──────────────┐   ┌────────────┐   ┌──────────────────┐
+│ moveit_ik.py │   │ros_preview │   │ros_preview_moveit│
+│  (IK/FK)     │   │   (legacy) │   │ (Planning/RViz)  │
+│              │   │            │   │                  │
+│ • compute_ik │   │ • joint    │   │ • plan_and       │
+│   _moveit()  │   │   _states  │   │   _preview       │
+│ • compute_fk │   │   publish  │   │   _trajectory()  │
+│   _moveit()  │   │            │   │ • Publishes to   │
+│ • Blocking   │   │            │   │   /move_group/   │
+│   service    │   │            │   │   display_planned│
+│   calls      │   │            │   │   _path          │
+│ • Dual-mode: │   │            │   │ • User approval  │
+│   persistent │   │            │   │   (y/n prompt)   │
+│   or one-shot│   │            │   │ • Dual-mode      │
+└──────────────┘   └────────────┘   └──────────────────┘
+```
+
+this allows to call moveit for the IK/FK solution it is then compared with the work FK on this model loaded in the covalent base and then executed 
+- the trajectory is shown on RVIZ and you are prompted wether to exectute
+
+Section 3  -> Steps to Reproduce
+--------------------------------
+
+this is where the setup get a little hard 
+I have 2 custom Ros Packages that I am made 
+1. Moveit setup assisant contains the urdf, kinematics, motion planning etc
+2. rosbridge_server to allow for web socket communication
+
+run:
+roslaunch rosbridge_server rosbridge_websocket.launch
+- roslaunch moveit_setup_assistant moveit_setup_assistant.launch
+roslaunch Reforge_LeRobot_moveit_config lerobot_ik.launch
+- starts the movegroup ros node, and everything else moveit for kinematics 
+
+python3 -m robots.teensy_serial_interface.test_interface
+- runs the test interface that connects to the teensy and rosbridge to do IK/FK and trajectory planning
