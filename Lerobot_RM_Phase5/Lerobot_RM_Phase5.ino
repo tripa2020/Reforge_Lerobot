@@ -336,7 +336,7 @@ void heartbeat_led_service();
 
 // MOVE mode servo operations (blocking)
 bool sync_write_positions(const uint8_t* ids, const uint16_t* positions,
-                          const uint16_t* speeds, uint8_t count);
+                          const uint16_t* times, const uint16_t* speeds, uint8_t count);
 int16_t read_servo_position_blocking(uint8_t id);
 
 // ============== SERVO TRANSPORT (Serial3-backed) ==============
@@ -583,14 +583,14 @@ void process_servo_frame(const uint8_t* buf, uint8_t len, uint32_t t_rx) {
 // ============== MOVE MODE SERVO FUNCTIONS ==============
 
 // SYNC WRITE to multiple servos
-// Packet: FF FF FE LEN INSTR ADDR DATA_LEN [ID1 D1 D2 D3 D4] [ID2...] CHECKSUM
+// Packet: FF FF FE LEN INSTR ADDR DATA_LEN [ID1 D1 D2 D3 D4 D5 D6] [ID2...] CHECKSUM
 bool sync_write_positions(const uint8_t* ids, const uint16_t* positions,
-                          const uint16_t* speeds, uint8_t count) {
+                          const uint16_t* times, const uint16_t* speeds, uint8_t count) {
     if (count == 0 || count > 6) return false;
 
     // Feetech SYNC_WRITE to 0x2A requires 6 bytes per servo:
     // 0x2A-0x2B: Goal Position (2 bytes)
-    // 0x2C-0x2D: Goal Time (2 bytes, 0=immediate)
+    // 0x2C-0x2D: Goal Time (2 bytes, milliseconds)
     // 0x2E-0x2F: Goal Speed (2 bytes)
     const uint8_t DATA_LEN = 6;
     uint8_t pkt_len = (DATA_LEN + 1) * count + 4;
@@ -609,8 +609,8 @@ bool sync_write_positions(const uint8_t* ids, const uint16_t* positions,
         pkt[idx++] = ids[i];
         pkt[idx++] = positions[i] & 0xFF;         // 0x2A: pos_lo
         pkt[idx++] = (positions[i] >> 8) & 0xFF;  // 0x2B: pos_hi
-        pkt[idx++] = 0x00;                        // 0x2C: time_lo (0=immediate)
-        pkt[idx++] = 0x00;                        // 0x2D: time_hi
+        pkt[idx++] = times[i] & 0xFF;             // 0x2C: time_lo
+        pkt[idx++] = (times[i] >> 8) & 0xFF;      // 0x2D: time_hi
         pkt[idx++] = speeds[i] & 0xFF;            // 0x2E: speed_lo
         pkt[idx++] = (speeds[i] >> 8) & 0xFF;     // 0x2F: speed_hi
     }
@@ -834,7 +834,7 @@ void process_usb_line(const char* line) {
 
     // ===== MODE_MOVE Commands =====
 
-    // SYNCW,<n>,<id1>,<pos1>,<spd1>,<id2>,<pos2>,<spd2>,...
+    // SYNCW,<n>,<id1>,<pos1>,<time1>,<spd1>,<id2>,<pos2>,<time2>,<spd2>,...
     // Raw SYNC WRITE - Python builds the command
     if (!strncmp(line, "SYNCW,", 6)) {
         if (g_mode != MODE_MOVE) {
@@ -854,6 +854,7 @@ void process_usb_line(const char* line) {
 
         uint8_t ids[6];
         uint16_t positions[6];
+        uint16_t times[6];
         uint16_t speeds[6];
         p = end;
 
@@ -881,6 +882,17 @@ void process_usb_line(const char* line) {
             if (*p != ',') { Serial.println("ERR,PARSE"); return; }
             p++;
 
+            // Time (milliseconds)
+            long time_ms = strtol(p, &end, 10);
+            if (end == p) { Serial.println("ERR,PARSE,TIME"); return; }
+            if (time_ms < 0) time_ms = 0;
+            if (time_ms > 65535) time_ms = 65535;
+            times[i] = (uint16_t)time_ms;
+            p = end;
+
+            if (*p != ',') { Serial.println("ERR,PARSE"); return; }
+            p++;
+
             // Speed
             long spd = strtol(p, &end, 10);
             if (end == p) { Serial.println("ERR,PARSE,SPD"); return; }
@@ -891,7 +903,7 @@ void process_usb_line(const char* line) {
         }
 
         // Execute SYNC WRITE
-        bool ok = sync_write_positions(ids, positions, speeds, (uint8_t)count);
+        bool ok = sync_write_positions(ids, positions, times, speeds, (uint8_t)count);
         Serial.println(ok ? "OK" : "ERR,SYNCW_FAIL");
         return;
     }
@@ -910,6 +922,159 @@ void process_usb_line(const char* line) {
             Serial.print(pos);
         }
         Serial.println();
+        return;
+    }
+
+    // MOVE,<n>,<id1>,<pos1>,<time1>,<spd1>,...,<tol>,<timeout_ms>
+    // Blocking move with settle verification
+    if (!strncmp(line, "MOVE,", 5)) {
+        if (g_mode != MODE_MOVE) {
+            Serial.println("ERR,MOVE_ONLY_IN_MOVE");
+            return;
+        }
+
+        const char* p = line + 5;
+        char* end;
+
+        // Parse count
+        long count = strtol(p, &end, 10);
+        if (end == p || count < 1 || count > 6) {
+            Serial.println("ERR,PARSE,COUNT");
+            return;
+        }
+
+        uint8_t ids[6];
+        uint16_t positions[6];
+        uint16_t times[6];
+        uint16_t speeds[6];
+        p = end;
+
+        // Parse servo parameters
+        for (int i = 0; i < count; i++) {
+            if (*p != ',') { Serial.println("ERR,PARSE"); return; }
+            p++;
+
+            // ID
+            long id = strtol(p, &end, 10);
+            if (end == p) { Serial.println("ERR,PARSE,ID"); return; }
+            ids[i] = (uint8_t)id;
+            p = end;
+
+            if (*p != ',') { Serial.println("ERR,PARSE"); return; }
+            p++;
+
+            // Position
+            long pos = strtol(p, &end, 10);
+            if (end == p) { Serial.println("ERR,PARSE,POS"); return; }
+            if (pos < 0) pos = 0;
+            if (pos > 4095) pos = 4095;
+            positions[i] = (uint16_t)pos;
+            p = end;
+
+            if (*p != ',') { Serial.println("ERR,PARSE"); return; }
+            p++;
+
+            // Time (milliseconds)
+            long time_ms = strtol(p, &end, 10);
+            if (end == p) { Serial.println("ERR,PARSE,TIME"); return; }
+            if (time_ms < 0) time_ms = 0;
+            if (time_ms > 65535) time_ms = 65535;
+            times[i] = (uint16_t)time_ms;
+            p = end;
+
+            if (*p != ',') { Serial.println("ERR,PARSE"); return; }
+            p++;
+
+            // Speed
+            long spd = strtol(p, &end, 10);
+            if (end == p) { Serial.println("ERR,PARSE,SPD"); return; }
+            if (spd < 0) spd = 0;
+            if (spd > 1023) spd = 1023;
+            speeds[i] = (uint16_t)spd;
+            p = end;
+        }
+
+        // Parse tolerance (encoder units)
+        if (*p != ',') { Serial.println("ERR,PARSE"); return; }
+        p++;
+        long tol = strtol(p, &end, 10);
+        if (end == p) { Serial.println("ERR,PARSE,TOL"); return; }
+        if (tol < 1) tol = 1;
+        if (tol > 200) tol = 200;
+        uint16_t tolerance = (uint16_t)tol;
+        p = end;
+
+        // Parse timeout (milliseconds)
+        if (*p != ',') { Serial.println("ERR,PARSE"); return; }
+        p++;
+        long timeout = strtol(p, &end, 10);
+        if (end == p) { Serial.println("ERR,PARSE,TIMEOUT"); return; }
+        if (timeout < 100) timeout = 100;
+        if (timeout > 30000) timeout = 30000;
+        uint32_t timeout_ms = (uint32_t)timeout;
+
+        // Execute SYNC WRITE
+        bool ok = sync_write_positions(ids, positions, times, speeds, (uint8_t)count);
+        if (!ok) {
+            Serial.println("ERR,SYNCW_FAIL");
+            return;
+        }
+
+        // Find max time to estimate settle duration
+        uint16_t max_time = 0;
+        for (int i = 0; i < count; i++) {
+            if (times[i] > max_time) max_time = times[i];
+        }
+
+        // Wait for estimated move time (80% of max time)
+        if (max_time > 0) {
+            delay((max_time * 8) / 10);
+        } else {
+            delay(50);  // Small delay for immediate moves
+        }
+
+        // Poll until settled or timeout
+        uint32_t start_ms = millis();
+        uint32_t stable_start_ms = 0;
+        const uint32_t STABLE_DURATION_MS = 50;  // Require 50ms stability
+        bool ever_settled = false;
+
+        while (millis() - start_ms < timeout_ms) {
+            // Read all specified servos
+            bool all_settled = true;
+            for (int i = 0; i < count; i++) {
+                int16_t current_pos = read_servo_position_blocking(ids[i]);
+                if (current_pos < 0) {
+                    // Read error
+                    Serial.println("ERR,READ_FAIL");
+                    return;
+                }
+
+                int16_t error = abs((int16_t)positions[i] - current_pos);
+                if (error > (int16_t)tolerance) {
+                    all_settled = false;
+                    break;
+                }
+            }
+
+            if (all_settled) {
+                if (stable_start_ms == 0) {
+                    stable_start_ms = millis();
+                    ever_settled = true;
+                } else if (millis() - stable_start_ms >= STABLE_DURATION_MS) {
+                    // Settled for required duration
+                    Serial.println("OK");
+                    return;
+                }
+            } else {
+                stable_start_ms = 0;  // Reset stability timer
+            }
+
+            delay(10);  // Poll at ~100Hz
+        }
+
+        // Timeout
+        Serial.println("ERR,TIMEOUT");
         return;
     }
 
@@ -1324,8 +1489,9 @@ void setup() {
     Serial.println("  MODE,DATA         - data idle (no frames until RUN,START)");
     Serial.println("  RUN,START         - start ISR + Serial4 streaming");
     Serial.println("  RUN,STOP          - stop ISR + streaming");
-    Serial.println("  SYNCW,n,id,p,s,.. - sync write (MOVE)");
+    Serial.println("  SYNCW,n,id,p,t,s,.. - sync write (MOVE)");
     Serial.println("  READJ             - read 6 joints (MOVE)");
+    Serial.println("  MOVE,n,id,p,t,s,..,tol,timeout - blocking move (MOVE)");
     Serial.println("  G,pos,spd         - goal stream (DATA_RUN)");
     Serial.println("Events: EVT,LOGGING_ON / EVT,LOGGING_OFF");
     Serial.println("");
