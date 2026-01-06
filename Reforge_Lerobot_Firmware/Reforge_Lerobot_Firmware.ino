@@ -30,6 +30,12 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include "ISM330_Bare.h"
+#include "ServoHardware.h"
+
+// ============== SERVO HARDWARE MODULE ==============
+// Phase 1: Blocking operations for MODE_MOVE (SYNCW, READJ, MOVE commands)
+// Protocol details hidden inside ServoHardware.cpp
+ServoHardware servo;
 
 // ARM Cortex-M7 Data Memory Barrier (for Seqlock synchronization)
 #if defined(__arm__) && defined(__IMXRT1062__)
@@ -56,18 +62,8 @@ static const float ACCEL_SENS = 0.061f / 1000.0f * 9.80665f;  // +/-2 g mode
 static const float GYRO_SENS = 4.375f / 1000.0f * (PI / 180.0f);  // +/-125 dps mode
 
 // ============== HARDWARE - SERVO ==============
-#define SERVO_BAUD 1000000        // 1 Mbps (Feetech default)
-#define SERVO_ID 6                // Default servo for G command (gripper)
-#define SERVO_TIMEOUT_US 800      // Response timeout
-
-// Feetech Protocol
-#define FEETECH_HEADER_1 0xFF
-#define FEETECH_HEADER_2 0xFF
-#define INSTR_READ_DATA 0x02
-#define INSTR_WRITE_DATA 0x03
-#define INSTR_SYNC_WRITE 0x83
-#define REG_PRESENT_POSITION_L 0x38
-#define REG_GOAL_POSITION_L 0x2A
+// NOTE: Servo hardware constants (baud rate, timeouts, protocol details) are now
+// encapsulated in the ServoHardware module. See ServoHardware.h for configuration.
 
 // ============== MODE STATE MACHINE ==============
 enum ModeState : uint8_t {
@@ -148,76 +144,16 @@ static_assert(sizeof(SensorData) == 64, "SensorData must be exactly 64 bytes");
 
 typedef SensorData CSVSample;
 
-// ============== SERVO STATE (FSM -> Frame ISR) ==============
-
-struct ServoState {
-    volatile int32_t  position;       // Last encoder position (0-4095, or -1 on error)
-    volatile uint32_t t_req_us;       // When READ request was sent
-    volatile uint32_t t_rx_us;        // When full response was parsed
-    volatile uint8_t  error_code;     // 0=OK, 1=timeout, 2=checksum, 3=framing
-    volatile uint32_t generation;     // Coherency counter (increment LAST)
-};
-
-// Global shared servo state
-volatile ServoState latest_servo = {
-    -1,       // position: invalid
-    0,        // t_req_us
-    0,        // t_rx_us
-    0xFF,     // error_code: not initialized
-    0         // generation
-};
+// ============== SERVO STATE ==============
+// NOTE: Servo state management has been moved to ServoHardware module.
+// Access via servo.snapshot() for ISR-safe reads.
 
 // Command tracking (for logging commanded vs actual position)
 volatile uint32_t g_last_cmd_time_us = 0;
 volatile uint16_t g_last_cmd_goal = 0xFFFF;  // Sentinel: no command sent yet
 volatile uint16_t g_last_cmd_time_ms = 0;    // Time parameter sent to servo
 
-// ============== SERVO RX FSM ==============
-
-enum ServoRxState {
-    RX_WAIT_HEADER1,
-    RX_WAIT_HEADER2,
-    RX_WAIT_ID,
-    RX_WAIT_LEN,
-    RX_WAIT_BODY
-};
-
-struct ServoRxFSM {
-    ServoRxState state;
-    uint8_t buf[16];
-    uint8_t idx;
-    uint8_t expected_len;
-};
-
-ServoRxFSM servo_rx = {RX_WAIT_HEADER1, {0}, 0, 0};
-
-// ============== SERVO READ STATE (Frame ISR sets flag, main loop sends) ==============
-
-struct ServoReadState {
-    volatile bool     request_in_flight;   // True if waiting for response
-    volatile bool     request_queued;      // Frame ISR asked for a READ
-    volatile uint32_t current_t_req_us;    // When we *actually* sent READ
-};
-
-ServoReadState servo_read = {false, false, 0};
-
-// ============== SERVO BUS MANAGER (for writes + timeout) ==============
-
-enum ServoBusState {
-    BUS_IDLE,
-    BUS_READ_WAIT,
-    BUS_WRITE_WAIT
-};
-
-struct ServoBusManager {
-    ServoBusState state;
-    uint32_t last_write_us;
-    uint32_t write_request_sent_us;  // For write timeout tracking
-};
-
-ServoBusManager servo_bus = {BUS_IDLE, 0, 0};
-
-const uint32_t SERVO_WRITE_INTERVAL_US = 10000; // 100 Hz max
+// NOTE: Servo RX FSM, read state, and bus manager moved to ServoHardware module.
 
 // ============== COMMAND QUEUE ==============
 
@@ -309,15 +245,9 @@ IntervalTimer frameTimer;
 
 // ============== FORWARD DECLARATIONS ==============
 void frame_isr();
-void servo_timeout_service();
-void servo_protocol_fsm();
-void servo_read_service();
 void servo_write_scheduler();
 void usb_goal_service();
 void process_usb_line(const char* line);
-void process_servo_frame(const uint8_t* buf, uint8_t len, uint32_t t_rx);
-uint8_t calculate_checksum(const uint8_t* data, uint8_t len);
-bool queue_servo_read_request();
 SensorData seqlock_read();
 void csv_push_sample(const CSVSample& sample);
 bool csv_buffer_full();
@@ -336,31 +266,12 @@ void stop_data_mode();
 void start_data_mode();
 void heartbeat_led_service();
 
-// MOVE mode servo operations (blocking)
-bool sync_write_positions(const uint8_t* ids, const uint16_t* positions,
-                          const uint16_t* times, const uint16_t* speeds, uint8_t count);
-int16_t read_servo_position_blocking(uint8_t id);
+// NOTE: MOVE mode servo operations now provided by ServoHardware module
+// - servo.syncWriteFull() replaces sync_write_positions()
+// - servo.readPosition() replaces read_servo_position_blocking()
 
-// ============== SERVO TRANSPORT (Serial3-backed) ==============
-
-static inline uint8_t servo_transport_write(const uint8_t* data, uint8_t len) {
-    size_t written = Serial3.write(data, len);
-    Serial3.flush();  // Block until TX complete (required for half-duplex timing)
-    return (uint8_t)written;
-}
-
-static inline int servo_transport_read_byte() {
-    if (Serial3.available() > 0) {
-        return Serial3.read();
-    }
-    return -1;
-}
-
-static inline void servo_transport_flush_rx() {
-    while (Serial3.available() > 0) {
-        Serial3.read();
-    }
-}
+// NOTE: Servo transport layer has been moved to ServoHardware module.
+// The module owns Serial3 initialization and all bus operations.
 
 // ============== COMMAND QUEUE FUNCTIONS ==============
 
@@ -390,284 +301,15 @@ uint8_t cmd_queue_count() {
     return (cmd_queue.head - cmd_queue.tail) & CMD_QUEUE_MASK;
 }
 
-// ============== FEETECH PROTOCOL ==============
-
-uint8_t calculate_checksum(const uint8_t* data, uint8_t len) {
-    uint8_t sum = 0;
-    for (uint8_t i = 2; i < len - 1; i++) {
-        sum += data[i];
-    }
-    return ~sum;
-}
-
-// ============== SERVO READ REQUEST (Called from Frame ISR) ==============
-
-bool queue_servo_read_request() {
-    if (servo_read.request_in_flight) {
-        return false;
-    }
-
-    if (servo_bus.state == BUS_WRITE_WAIT) {
-        return false;
-    }
-
-    servo_read.request_queued = true;
-    return true;
-}
-
-// ============== SERVO READ SERVICE (Called from Main Loop) ==============
-
-void servo_read_service() {
-    if (!servo_read.request_queued) return;
-    if (servo_read.request_in_flight) return;
-    if (servo_bus.state == BUS_WRITE_WAIT) return;
-
-    // Build READ_POSITION request (8 bytes)
-    uint8_t req[8];
-    req[0] = FEETECH_HEADER_1;
-    req[1] = FEETECH_HEADER_2;
-    req[2] = g_stream_servo_id;
-    req[3] = 0x04;  // Length
-    req[4] = INSTR_READ_DATA;
-    req[5] = REG_PRESENT_POSITION_L;
-    req[6] = 0x02;  // Read 2 bytes
-    req[7] = calculate_checksum(req, 8);
-
-    uint8_t sent = servo_transport_write(req, 8);
-    if (sent < 8) {
-        return;
-    }
-
-    servo_read.current_t_req_us = micros();
-    servo_read.request_in_flight = true;
-    servo_read.request_queued = false;
-    servo_bus.state = BUS_READ_WAIT;
-}
-
-// ============== SERVO TIMEOUT SERVICE ==============
-
-void servo_timeout_service() {
-    uint32_t now_us = micros();
-
-    // Check read timeout
-    if (servo_read.request_in_flight) {
-        uint32_t elapsed = now_us - servo_read.current_t_req_us;
-
-        if (elapsed > SERVO_TIMEOUT_US) {
-            latest_servo.error_code = 1;  // Timeout
-            SEQLOCK_BARRIER();
-            latest_servo.generation++;
-
-            stats.servo_timeouts++;
-            stats.servo_errors++;
-
-            servo_read.request_in_flight = false;
-            servo_bus.state = BUS_IDLE;
-            servo_rx.state = RX_WAIT_HEADER1;
-        }
-    }
-
-    // Check write timeout
-    if (servo_bus.state == BUS_WRITE_WAIT) {
-        uint32_t elapsed = now_us - servo_bus.write_request_sent_us;
-
-        if (elapsed > SERVO_TIMEOUT_US) {
-            servo_bus.state = BUS_IDLE;
-            servo_rx.state = RX_WAIT_HEADER1;
-        }
-    }
-}
-
-// ============== SERVO PROTOCOL FSM ==============
-
-void servo_protocol_fsm() {
-    int byte;
-
-    while ((byte = servo_transport_read_byte()) >= 0) {
-        switch (servo_rx.state) {
-
-        case RX_WAIT_HEADER1:
-            if (byte == FEETECH_HEADER_1) {
-                servo_rx.buf[0] = byte;
-                servo_rx.state = RX_WAIT_HEADER2;
-            }
-            break;
-
-        case RX_WAIT_HEADER2:
-            if (byte == FEETECH_HEADER_2) {
-                servo_rx.buf[1] = byte;
-                servo_rx.state = RX_WAIT_ID;
-            } else {
-                servo_rx.state = RX_WAIT_HEADER1;
-                stats.servo_resync_count++;
-            }
-            break;
-
-        case RX_WAIT_ID:
-            servo_rx.buf[2] = byte;
-            servo_rx.state = RX_WAIT_LEN;
-            break;
-
-        case RX_WAIT_LEN:
-            servo_rx.buf[3] = byte;
-            servo_rx.expected_len = byte;
-            servo_rx.idx = 4;
-            servo_rx.state = RX_WAIT_BODY;
-            break;
-
-        case RX_WAIT_BODY:
-            servo_rx.buf[servo_rx.idx++] = byte;
-            if (servo_rx.idx >= (uint8_t)(servo_rx.expected_len + 4)) {
-                uint32_t t_rx = micros();
-                process_servo_frame(servo_rx.buf, servo_rx.idx, t_rx);
-                servo_rx.state = RX_WAIT_HEADER1;
-            }
-            break;
-        }
-    }
-}
-
-// ============== PROCESS SERVO FRAME ==============
-
-void process_servo_frame(const uint8_t* buf, uint8_t len, uint32_t t_rx) {
-    // Check if this is a WRITE ACK (6 bytes, len field = 0x02)
-    if (len == 6 && buf[3] == 0x02) {
-        servo_bus.state = BUS_IDLE;
-        return;
-    }
-
-    bool valid = true;
-    uint8_t error_code = 0;
-
-    if (len < 6) {
-        valid = false;
-        error_code = 3;  // Framing
-    }
-
-    if (valid && buf[2] != g_stream_servo_id) {
-        valid = false;
-        error_code = 3;  // Wrong servo
-    }
-
-    if (valid) {
-        uint8_t calc = calculate_checksum(buf, len);
-        if (buf[len - 1] != calc) {
-            valid = false;
-            error_code = 2;  // Checksum
-            stats.servo_checksum_errors++;
-        }
-    }
-
-    if (valid && buf[4] != 0x00) {
-        valid = false;
-        error_code = 3;  // Servo reported error
-    }
-
-    if (valid && len >= 8) {
-        int32_t pos = buf[5] | (buf[6] << 8);
-
-        latest_servo.position = pos;
-        latest_servo.t_req_us = servo_read.current_t_req_us;
-        latest_servo.t_rx_us = t_rx;
-        latest_servo.error_code = 0;
-        SEQLOCK_BARRIER();
-        latest_servo.generation++;
-    } else {
-        if (error_code == 0) error_code = 3;
-        latest_servo.error_code = error_code;
-        SEQLOCK_BARRIER();
-        latest_servo.generation++;
-
-        stats.servo_errors++;
-        if (error_code == 3) stats.servo_framing_errors++;
-    }
-
-    servo_read.request_in_flight = false;
-    servo_bus.state = BUS_IDLE;
-}
+// NOTE: Feetech protocol functions (calculate_checksum, queue_servo_read_request,
+// servo_read_service, servo_timeout_service, servo_protocol_fsm, process_servo_frame)
+// have been moved to ServoHardware module. All bus operations now go through servo.poll().
 
 // ============== MOVE MODE SERVO FUNCTIONS ==============
-
-// SYNC WRITE to multiple servos
-// Packet: FF FF FE LEN INSTR ADDR DATA_LEN [ID1 D1 D2 D3 D4 D5 D6] [ID2...] CHECKSUM
-bool sync_write_positions(const uint8_t* ids, const uint16_t* positions,
-                          const uint16_t* times, const uint16_t* speeds, uint8_t count) {
-    if (count == 0 || count > 6) return false;
-
-    // Feetech SYNC_WRITE to 0x2A requires 6 bytes per servo:
-    // 0x2A-0x2B: Goal Position (2 bytes)
-    // 0x2C-0x2D: Goal Time (2 bytes, milliseconds)
-    // 0x2E-0x2F: Goal Speed (2 bytes)
-    const uint8_t DATA_LEN = 6;
-    uint8_t pkt_len = (DATA_LEN + 1) * count + 4;
-    uint8_t pkt[64];
-
-    pkt[0] = FEETECH_HEADER_1;
-    pkt[1] = FEETECH_HEADER_2;
-    pkt[2] = 0xFE;  // Broadcast ID
-    pkt[3] = pkt_len;
-    pkt[4] = INSTR_SYNC_WRITE;
-    pkt[5] = REG_GOAL_POSITION_L;
-    pkt[6] = DATA_LEN;
-
-    uint8_t idx = 7;
-    for (uint8_t i = 0; i < count; i++) {
-        pkt[idx++] = ids[i];
-        pkt[idx++] = positions[i] & 0xFF;         // 0x2A: pos_lo
-        pkt[idx++] = (positions[i] >> 8) & 0xFF;  // 0x2B: pos_hi
-        pkt[idx++] = times[i] & 0xFF;             // 0x2C: time_lo
-        pkt[idx++] = (times[i] >> 8) & 0xFF;      // 0x2D: time_hi
-        pkt[idx++] = speeds[i] & 0xFF;            // 0x2E: speed_lo
-        pkt[idx++] = (speeds[i] >> 8) & 0xFF;     // 0x2F: speed_hi
-    }
-
-    // Checksum (sum bytes 2..idx-1, invert)
-    uint8_t sum = 0;
-    for (uint8_t i = 2; i < idx; i++) sum += pkt[i];
-    pkt[idx++] = ~sum;
-
-    servo_transport_flush_rx();
-    uint8_t sent = servo_transport_write(pkt, idx);
-
-    // SYNC WRITE broadcast has no response
-    return (sent == idx);
-}
-
-// Read single servo position (blocking, called sequentially for READJ)
-int16_t read_servo_position_blocking(uint8_t id) {
-    uint8_t req[8];
-    req[0] = FEETECH_HEADER_1;
-    req[1] = FEETECH_HEADER_2;
-    req[2] = id;
-    req[3] = 0x04;
-    req[4] = INSTR_READ_DATA;
-    req[5] = REG_PRESENT_POSITION_L;
-    req[6] = 0x02;
-    req[7] = calculate_checksum(req, 8);
-
-    servo_transport_flush_rx();
-    servo_transport_write(req, 8);
-
-    // Wait for response (blocking OK in MOVE mode)
-    uint32_t start = micros();
-    uint8_t buf[16];
-    uint8_t idx = 0;
-
-    while ((micros() - start) < 2000 && idx < 8) {
-        if (Serial3.available()) {
-            buf[idx++] = Serial3.read();
-        }
-    }
-
-    // Parse: FF FF ID LEN ERR POS_L POS_H CHECKSUM
-    if (idx >= 8 && buf[0] == 0xFF && buf[1] == 0xFF && buf[2] == id) {
-        uint8_t calc = calculate_checksum(buf, 8);
-        if (buf[7] == calc && buf[4] == 0x00) {  // No error
-            return (int16_t)(buf[5] | (buf[6] << 8));
-        }
-    }
-    return -1;  // Error or timeout
-}
+// NOTE: Blocking servo operations (sync_write_positions, read_servo_position_blocking)
+// have been migrated to ServoHardware module. See ServoHardware.h for API.
+// - servo.syncWriteFull() for multi-servo writes
+// - servo.readPosition() for single servo reads
 
 // ============== MODE TRANSITION FUNCTIONS ==============
 
@@ -680,16 +322,8 @@ void stop_data_mode() {
     uint32_t t0 = micros();
     while (isr_active && (micros() - t0 < 2000)) { /* spin */ }
 
-    // Purge servo bus state
-    servo_transport_flush_rx();
-    delayMicroseconds(50);  // Allow in-flight bytes to arrive
-    servo_transport_flush_rx();
-
-    // Reset servo FSM state
-    servo_read.request_in_flight = false;
-    servo_read.request_queued = false;
-    servo_bus.state = BUS_IDLE;
-    servo_rx.state = RX_WAIT_HEADER1;
+    // Reset ServoHardware async state (flushes RX, clears FSM, resets flags)
+    servo.resetAsyncState();
 }
 
 void start_data_mode() {
@@ -859,7 +493,7 @@ void process_usb_line(const char* line) {
         }
 
         uint8_t ids[6];
-        uint16_t positions[6];
+        int16_t positions[6];   // int16_t for ServoHardware API
         uint16_t times[6];
         uint16_t speeds[6];
         p = end;
@@ -882,7 +516,7 @@ void process_usb_line(const char* line) {
             if (end == p) { Serial.println("ERR,PARSE,POS"); return; }
             if (pos < 0) pos = 0;
             if (pos > 4095) pos = 4095;
-            positions[i] = (uint16_t)pos;
+            positions[i] = (int16_t)pos;
             p = end;
 
             if (*p != ',') { Serial.println("ERR,PARSE"); return; }
@@ -908,13 +542,13 @@ void process_usb_line(const char* line) {
             p = end;
         }
 
-        // Execute SYNC WRITE
-        bool ok = sync_write_positions(ids, positions, times, speeds, (uint8_t)count);
+        // Execute SYNC WRITE via ServoHardware module
+        bool ok = servo.syncWriteFull(ids, positions, times, speeds, (uint8_t)count);
         Serial.println(ok ? "OK" : "ERR,SYNCW_FAIL");
         return;
     }
 
-    // READJ - read all 6 joint positions
+    // READJ - read all 6 joint positions via ServoHardware
     if (!strcasecmp(line, "READJ")) {
         if (g_mode != MODE_MOVE) {
             Serial.println("ERR,READJ_ONLY_IN_MOVE");
@@ -923,7 +557,8 @@ void process_usb_line(const char* line) {
 
         Serial.print("POS");
         for (uint8_t id = 1; id <= 6; id++) {
-            int16_t pos = read_servo_position_blocking(id);
+            int16_t pos = servo.readPosition(id);
+            // SERVO_ERROR (-9999) will be printed as-is, host can detect
             Serial.print(",");
             Serial.print(pos);
         }
@@ -950,7 +585,7 @@ void process_usb_line(const char* line) {
         }
 
         uint8_t ids[6];
-        uint16_t positions[6];
+        int16_t positions[6];   // int16_t for ServoHardware API
         uint16_t times[6];
         uint16_t speeds[6];
         p = end;
@@ -974,7 +609,7 @@ void process_usb_line(const char* line) {
             if (end == p) { Serial.println("ERR,PARSE,POS"); return; }
             if (pos < 0) pos = 0;
             if (pos > 4095) pos = 4095;
-            positions[i] = (uint16_t)pos;
+            positions[i] = (int16_t)pos;
             p = end;
 
             if (*p != ',') { Serial.println("ERR,PARSE"); return; }
@@ -1019,8 +654,8 @@ void process_usb_line(const char* line) {
         if (timeout > 30000) timeout = 30000;
         uint32_t timeout_ms = (uint32_t)timeout;
 
-        // Execute SYNC WRITE
-        bool ok = sync_write_positions(ids, positions, times, speeds, (uint8_t)count);
+        // Execute SYNC WRITE via ServoHardware module
+        bool ok = servo.syncWriteFull(ids, positions, times, speeds, (uint8_t)count);
         if (!ok) {
             Serial.println("ERR,SYNCW_FAIL");
             return;
@@ -1046,17 +681,17 @@ void process_usb_line(const char* line) {
         bool ever_settled = false;
 
         while (millis() - start_ms < timeout_ms) {
-            // Read all specified servos
+            // Read all specified servos via ServoHardware
             bool all_settled = true;
             for (int i = 0; i < count; i++) {
-                int16_t current_pos = read_servo_position_blocking(ids[i]);
-                if (current_pos < 0) {
-                    // Read error
+                int16_t current_pos = servo.readPosition(ids[i]);
+                if (current_pos == ServoHardware::SERVO_ERROR) {
+                    // Read error (timeout or invalid response)
                     Serial.println("ERR,READ_FAIL");
                     return;
                 }
 
-                int16_t error = abs((int16_t)positions[i] - current_pos);
+                int16_t error = abs(positions[i] - current_pos);
                 if (error > (int16_t)tolerance) {
                     all_settled = false;
                     break;
@@ -1193,52 +828,21 @@ void usb_goal_service() {
 }
 
 // ============== SERVO WRITE SCHEDULER ==============
+// Dequeues commands and sends via ServoHardware
 
 void servo_write_scheduler() {
-    uint32_t now_us = micros();
-
-    // Rate limit writes
-    if (now_us - servo_bus.last_write_us < SERVO_WRITE_INTERVAL_US) return;
-
-    // Don't write if read is pending
-    if (servo_bus.state != BUS_IDLE) return;
-
     // Check command queue
     ServoCommand cmd;
     if (!dequeue_goal_cmd(&cmd)) return;
 
-    // Build WRITE_GOAL packet with time parameter
-    // Writes 6 bytes to registers 0x2A-0x2F: pos(2) + time(2) + speed(2)
-    // This enables servo internal interpolation over time_ms
-    uint8_t pkt[13];
-    pkt[0] = FEETECH_HEADER_1;
-    pkt[1] = FEETECH_HEADER_2;
-    pkt[2] = cmd.servo_id;
-    pkt[3] = 9;  // Length: instr(1) + addr(1) + data(6) + checksum(1)
-    pkt[4] = INSTR_WRITE_DATA;
-    pkt[5] = REG_GOAL_POSITION_L;              // 0x2A
-    pkt[6] = cmd.goal_position & 0xFF;         // 0x2A: pos_lo
-    pkt[7] = (cmd.goal_position >> 8) & 0xFF;  // 0x2B: pos_hi
-    pkt[8] = cmd.goal_time_ms & 0xFF;          // 0x2C: time_lo (ms)
-    pkt[9] = (cmd.goal_time_ms >> 8) & 0xFF;   // 0x2D: time_hi
-    pkt[10] = cmd.goal_speed & 0xFF;           // 0x2E: speed_lo
-    pkt[11] = (cmd.goal_speed >> 8) & 0xFF;    // 0x2F: speed_hi
-    pkt[12] = calculate_checksum(pkt, 13);
-
-    servo_transport_flush_rx();
-    servo_transport_write(pkt, 13);
+    // Send via ServoHardware (handles rate limiting and bus state)
+    servo.writeGoal(cmd.servo_id, (int16_t)cmd.goal_position,
+                    cmd.goal_time_ms, cmd.goal_speed);
 
     // Capture command for logging
-    g_last_cmd_time_us = now_us;
+    g_last_cmd_time_us = micros();
     g_last_cmd_goal = cmd.goal_position;
     g_last_cmd_time_ms = cmd.goal_time_ms;
-
-    servo_bus.write_request_sent_us = now_us;
-    servo_bus.last_write_us = now_us;
-    servo_bus.state = BUS_WRITE_WAIT;
-
-    servo_rx.state = RX_WAIT_HEADER1;
-    servo_rx.idx = 0;
 }
 
 // ============== SEQLOCK READER ==============
@@ -1328,34 +932,24 @@ void frame_isr() {
     d.gyro_z_rads = raw.gz * GYRO_SENS;
     d.imu_read_us = imu_end - imu_start;
 
-    // ---- 2) QUEUE SERVO TX ----
-    queue_servo_read_request();
+    // ---- 2) QUEUE SERVO TX (via ServoHardware) ----
+    servo.queueRead(g_stream_servo_id);
 
-    // ---- 3) SNAPSHOT SERVO STATE ----
+    // ---- 3) SNAPSHOT SERVO STATE (via ServoHardware) ----
     {
-        ServoState s;
-        uint32_t g1, g2;
+        ServoHardware::Snapshot snap = servo.snapshot();
 
-        do {
-            g1 = latest_servo.generation;
-            s.position = latest_servo.position;
-            s.t_req_us = latest_servo.t_req_us;
-            s.t_rx_us = latest_servo.t_rx_us;
-            s.error_code = latest_servo.error_code;
-            g2 = latest_servo.generation;
-        } while (g1 != g2);
-
-        d.servo_position = s.position;
+        d.servo_position = snap.position;
 
         // Pack queue depth (upper 4 bits) + servo error (lower 4 bits)
         // Queue depth 0-15 (capped), error code 0-3
         uint8_t q_depth = cmd_queue_count();
         if (q_depth > 15) q_depth = 15;
-        d.servo_error_code = (q_depth << 4) | (s.error_code & 0x0F);
+        d.servo_error_code = (q_depth << 4) | (snap.error_code & 0x0F);
 
-        if (s.t_rx_us != 0 && s.t_rx_us <= d.frame_ts_us && s.error_code == 0) {
-            d.servo_age_us = (uint16_t)(d.frame_ts_us - s.t_rx_us);
-            d.servo_latency_us = (uint16_t)(s.t_rx_us - s.t_req_us);
+        if (snap.t_rx_us != 0 && snap.t_rx_us <= d.frame_ts_us && snap.error_code == 0) {
+            d.servo_age_us = (uint16_t)(d.frame_ts_us - snap.t_rx_us);
+            d.servo_latency_us = (uint16_t)(snap.t_rx_us - snap.t_req_us);
         } else {
             d.servo_age_us = 0xFFFF;
             d.servo_latency_us = 0;
@@ -1510,10 +1104,10 @@ void setup() {
     Serial4.begin(SERIAL_CSV_BAUD);
     delay(100);
 
-    // Servo UART
-    Serial3.begin(SERVO_BAUD);
+    // Servo bus (ServoHardware owns Serial3 initialization)
+    servo.init(Serial3);
     #if ENABLE_DEBUG_OUTPUT
-    Serial.println("Serial3 initialized @ 1 Mbaud");
+    Serial.println("ServoHardware initialized @ 1 Mbaud");
     #endif
 
     // Initialize IMU
@@ -1626,9 +1220,8 @@ void loop() {
             break;
 
         case MODE_MOVE:
-            // Motion mode: blocking RPC operations, no ISR
-            servo_protocol_fsm();
-            servo_timeout_service();
+            // Motion mode: blocking RPC operations via ServoHardware
+            // No async servicing needed - blocking calls handle everything
             break;
 
         case MODE_DATA_IDLE:
@@ -1637,9 +1230,8 @@ void loop() {
 
         case MODE_DATA_RUN:
             // Full 500Hz data acquisition pipeline
-            servo_protocol_fsm();
-            servo_timeout_service();
-            servo_read_service();
+            // ServoHardware handles: RX parsing, timeouts, queued TX
+            servo.poll();
             servo_write_scheduler();
 
             // Snapshot and log
