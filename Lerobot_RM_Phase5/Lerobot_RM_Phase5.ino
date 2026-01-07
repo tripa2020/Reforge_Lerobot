@@ -58,7 +58,8 @@ static const float GYRO_SENS = 4.375f / 1000.0f * (PI / 180.0f);  // +/-125 dps 
 // ============== HARDWARE - SERVO ==============
 #define SERVO_BAUD 1000000        // 1 Mbps (Feetech default)
 #define SERVO_ID 6                // Default servo for G command (gripper)
-#define SERVO_TIMEOUT_US 800      // Response timeout
+#define SERVO_READ_TIMEOUT_US 800      // Encoder read response timeout
+#define SERVO_WRITE_TIMEOUT_US 200     // Goal write ACK timeout (shortened per ServoBUS_Cooperation.md)
 
 // Feetech Protocol
 #define FEETECH_HEADER_1 0xFF
@@ -92,6 +93,10 @@ volatile bool run_req_stop  = false;
 volatile bool evt_logging_on_pending  = false;
 volatile bool evt_logging_off_pending = false;
 volatile bool logging_has_written_any = false;  // Set true on first Serial4 write
+
+// Phase-locked goal dispatch (Option B from ServoBUS_Cooperation.md)
+// Set by Frame ISR every 5th frame (100Hz), cleared by servo_write_scheduler()
+volatile bool goal_dispatch_frame_pending = false;
 
 static inline const char* mode_str(ModeState m) {
     switch(m) {
@@ -290,7 +295,7 @@ uint32_t last_stats_print_ms = 0;
 
 // ============== USB GOAL PARSER ==============
 // Non-blocking ASCII line parser for host goal commands
-// Protocol: "G,<pos>,<speed>\n" where pos=[0..4095], speed=[0..1023]
+// Protocol: "G,<pos>,<time_ms>,<speed>\n" where pos=[0..4095], time_ms=[0..65535], speed=[0..1023]
 
 struct UsbGoalParser {
     static const uint16_t BUF_SIZE = 256;  // Increased from 64
@@ -449,11 +454,11 @@ void servo_read_service() {
 void servo_timeout_service() {
     uint32_t now_us = micros();
 
-    // Check read timeout
+    // Check read timeout (encoder response)
     if (servo_read.request_in_flight) {
         uint32_t elapsed = now_us - servo_read.current_t_req_us;
 
-        if (elapsed > SERVO_TIMEOUT_US) {
+        if (elapsed > SERVO_READ_TIMEOUT_US) {
             latest_servo.error_code = 1;  // Timeout
             SEQLOCK_BARRIER();
             latest_servo.generation++;
@@ -467,11 +472,12 @@ void servo_timeout_service() {
         }
     }
 
-    // Check write timeout
+    // Check write timeout (goal ACK) - shortened to 200µs per ServoBUS_Cooperation.md
+    // This provides guard time for ACK bytes without blocking encoder reads
     if (servo_bus.state == BUS_WRITE_WAIT) {
         uint32_t elapsed = now_us - servo_bus.write_request_sent_us;
 
-        if (elapsed > SERVO_TIMEOUT_US) {
+        if (elapsed > SERVO_WRITE_TIMEOUT_US) {
             servo_bus.state = BUS_IDLE;
             servo_rx.state = RX_WAIT_HEADER1;
         }
@@ -1195,17 +1201,25 @@ void usb_goal_service() {
 // ============== SERVO WRITE SCHEDULER ==============
 
 void servo_write_scheduler() {
-    uint32_t now_us = micros();
+    // Phase-locked dispatch: only on frame-triggered cycles (100Hz)
+    // Replaces rate limiting - see ServoBUS_Cooperation.md
+    if (!goal_dispatch_frame_pending) return;
 
-    // Rate limit writes
-    if (now_us - servo_bus.last_write_us < SERVO_WRITE_INTERVAL_US) return;
-
-    // Don't write if read is pending
+    // Don't write if read is pending (bus safety)
     if (servo_bus.state != BUS_IDLE) return;
 
     // Check command queue
     ServoCommand cmd;
-    if (!dequeue_goal_cmd(&cmd)) return;
+    if (!dequeue_goal_cmd(&cmd)) {
+        // Queue empty - clear flag but don't dispatch
+        goal_dispatch_frame_pending = false;
+        return;
+    }
+
+    // Clear flag - we're dispatching this cycle
+    goal_dispatch_frame_pending = false;
+
+    uint32_t now_us = micros();
 
     // Build WRITE_GOAL packet with time parameter
     // Writes 6 bytes to registers 0x2A-0x2F: pos(2) + time(2) + speed(2)
@@ -1330,6 +1344,13 @@ void frame_isr() {
 
     // ---- 2) QUEUE SERVO TX ----
     queue_servo_read_request();
+
+    // ---- 2.5) PHASE-LOCKED GOAL DISPATCH (100Hz) ----
+    // Every 5th frame = 10ms intervals, synchronized to sensor sampling
+    // See ServoBUS_Cooperation.md for architecture rationale
+    if ((d.frame_index % 5) == 0) {
+        goal_dispatch_frame_pending = true;
+    }
 
     // ---- 3) SNAPSHOT SERVO STATE ----
     {
@@ -1560,7 +1581,7 @@ void setup() {
     Serial.println("  SYNCW,n,id,p,t,s,.. - sync write (MOVE)");
     Serial.println("  READJ             - read 6 joints (MOVE)");
     Serial.println("  MOVE,n,id,p,t,s,..,tol,timeout - blocking move (MOVE)");
-    Serial.println("  G,pos,spd         - goal stream (DATA_RUN)");
+    Serial.println("  G,pos,time,spd    - goal stream (DATA_RUN)");
     Serial.println("Events: EVT,LOGGING_ON / EVT,LOGGING_OFF");
     Serial.println("");
     Serial.println("Waiting for MODE command...");
