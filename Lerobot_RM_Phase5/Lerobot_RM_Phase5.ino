@@ -31,6 +31,12 @@
 #include <SPI.h>
 #include "ISM330_Bare.h"
 
+// Forward declarations for Arduino preprocessor (must precede function prototypes)
+struct SyncwEntry;
+bool enqueue_syncw(const SyncwEntry& entry);
+bool dequeue_syncw(SyncwEntry* out);
+void syncw_dispatch_service();
+
 // ARM Cortex-M7 Data Memory Barrier (for Seqlock synchronization)
 #if defined(__arm__) && defined(__IMXRT1062__)
   #define SEQLOCK_BARRIER() asm volatile("dmb" ::: "memory")
@@ -243,6 +249,58 @@ struct CommandQueue {
 };
 
 CommandQueue cmd_queue = {{}, 0, 0};
+
+// ============== SYNCW QUEUE (MODE_MOVE queued dispatch) ==============
+// 5-joint trajectory queue for firmware-timed MOVE mode execution
+// Dispatched at 100Hz via micros() timer in loop()
+
+struct SyncwEntry {
+    uint16_t positions[5];  // J1-J5 encoder values
+    uint16_t time_ms;       // Interpolation time
+    uint16_t speed;         // Speed limit
+};
+
+#define SYNCW_QUEUE_SIZE 256
+#define SYNCW_QUEUE_MASK (SYNCW_QUEUE_SIZE - 1)
+
+struct SyncwQueue {
+    SyncwEntry buf[SYNCW_QUEUE_SIZE];
+    volatile uint8_t head;
+    volatile uint8_t tail;
+};
+
+SyncwQueue syncw_queue = {{}, 0, 0};
+
+// SYNCW dispatch state
+volatile bool syncw_dispatch_enabled = false;
+volatile uint32_t syncw_expected_count = 0;
+volatile uint32_t syncw_dispatched_count = 0;
+uint32_t last_syncw_dispatch_us = 0;
+
+// SYNCW queue helpers
+inline uint8_t syncw_queue_count() {
+    return (syncw_queue.head - syncw_queue.tail) & SYNCW_QUEUE_MASK;
+}
+
+inline bool syncw_queue_full() {
+    return ((syncw_queue.head + 1) & SYNCW_QUEUE_MASK) == syncw_queue.tail;
+}
+
+bool enqueue_syncw(const SyncwEntry& entry) {
+    if (syncw_queue_full()) return false;
+    syncw_queue.buf[syncw_queue.head] = entry;
+    syncw_queue.head = (syncw_queue.head + 1) & SYNCW_QUEUE_MASK;
+    return true;
+}
+
+bool dequeue_syncw(SyncwEntry* out) {
+    if (syncw_queue.head == syncw_queue.tail) return false;
+    *out = syncw_queue.buf[syncw_queue.tail];
+    syncw_queue.tail = (syncw_queue.tail + 1) & SYNCW_QUEUE_MASK;
+    return true;
+}
+
+// NOTE: syncw_dispatch_service() is defined after sync_write_positions()
 
 // ============== SEQLOCK BUFFER ==============
 
@@ -639,6 +697,44 @@ bool sync_write_positions(const uint8_t* ids, const uint16_t* positions,
     return (sent == idx);
 }
 
+// SYNCW dispatch service - called from loop() in MODE_MOVE
+// Dispatches queued waypoints at 100Hz (10ms intervals) using micros() timer
+void syncw_dispatch_service() {
+    if (!syncw_dispatch_enabled) return;
+
+    uint32_t now_us = micros();
+
+    // 100Hz dispatch rate = 10000us interval
+    if ((now_us - last_syncw_dispatch_us) < 10000) return;
+
+    last_syncw_dispatch_us = now_us;
+
+    // Try to dequeue and dispatch
+    SyncwEntry entry;
+    if (dequeue_syncw(&entry)) {
+        // Build servo ID array (J1-J5 = servos 1-5)
+        uint8_t ids[5] = {1, 2, 3, 4, 5};
+        uint16_t times[5];
+        uint16_t speeds[5];
+
+        for (int i = 0; i < 5; i++) {
+            times[i] = entry.time_ms;
+            speeds[i] = entry.speed;
+        }
+
+        // Execute SYNC WRITE to servos
+        sync_write_positions(ids, entry.positions, times, speeds, 5);
+
+        syncw_dispatched_count++;
+
+        // Check if we've dispatched expected count
+        if (syncw_dispatched_count >= syncw_expected_count) {
+            syncw_dispatch_enabled = false;
+            Serial.println("EVT,MOVE_DONE");
+        }
+    }
+}
+
 // Read single servo position (blocking, called sequentially for READJ)
 int16_t read_servo_position_blocking(uint8_t id) {
     uint8_t req[8];
@@ -914,7 +1010,26 @@ void process_usb_line(const char* line) {
             p = end;
         }
 
-        // Execute SYNC WRITE
+        // Check if queued dispatch is enabled (burst streaming mode)
+        if (syncw_dispatch_enabled && count == 5) {
+            // Queue for firmware-timed dispatch
+            SyncwEntry entry;
+            for (int i = 0; i < 5; i++) {
+                entry.positions[i] = positions[i];
+            }
+            entry.time_ms = times[0];  // Use first servo's time for all
+            entry.speed = speeds[0];   // Use first servo's speed for all
+
+            if (enqueue_syncw(entry)) {
+                // Silent OK for queued mode (reduce USB traffic during streaming)
+                // Host tracks count via MOVE,START response
+            } else {
+                Serial.println("ERR,SYNCW_QUEUE_FULL");
+            }
+            return;
+        }
+
+        // Immediate execute (legacy mode or non-5-joint commands)
         bool ok = sync_write_positions(ids, positions, times, speeds, (uint8_t)count);
         Serial.println(ok ? "OK" : "ERR,SYNCW_FAIL");
         return;
@@ -934,6 +1049,50 @@ void process_usb_line(const char* line) {
             Serial.print(pos);
         }
         Serial.println();
+        return;
+    }
+
+    // MOVE,START,<count> - Enable queued SYNCW dispatch at 100Hz
+    // count = expected number of waypoints (for EVT,MOVE_DONE detection)
+    if (!strncmp(line, "MOVE,START,", 11)) {
+        if (g_mode != MODE_MOVE) {
+            Serial.println("ERR,MOVE_START_ONLY_IN_MOVE");
+            return;
+        }
+
+        const char* p = line + 11;
+        char* end;
+        long count = strtol(p, &end, 10);
+        if (end == p || count < 1) {
+            Serial.println("ERR,PARSE,COUNT");
+            return;
+        }
+
+        // Reset state and enable dispatch
+        syncw_queue.head = 0;
+        syncw_queue.tail = 0;
+        syncw_expected_count = (uint32_t)count;
+        syncw_dispatched_count = 0;
+        last_syncw_dispatch_us = micros();  // Start timing from now
+        syncw_dispatch_enabled = true;
+
+        Serial.print("MOVE,START,OK,");
+        Serial.println(count);
+        return;
+    }
+
+    // MOVE,STOP - Disable queued dispatch (abort trajectory)
+    if (!strcmp(line, "MOVE,STOP")) {
+        if (g_mode != MODE_MOVE) {
+            Serial.println("ERR,MOVE_STOP_ONLY_IN_MOVE");
+            return;
+        }
+
+        syncw_dispatch_enabled = false;
+
+        // Report how many were dispatched before stop
+        Serial.print("MOVE,STOP,OK,");
+        Serial.println(syncw_dispatched_count);
         return;
     }
 
@@ -1650,6 +1809,7 @@ void loop() {
             // Motion mode: blocking RPC operations, no ISR
             servo_protocol_fsm();
             servo_timeout_service();
+            syncw_dispatch_service();  // 100Hz queued trajectory dispatch
             break;
 
         case MODE_DATA_IDLE:
