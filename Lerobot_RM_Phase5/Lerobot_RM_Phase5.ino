@@ -298,9 +298,9 @@ uint32_t last_stats_print_ms = 0;
 // Protocol: "G,<pos>,<time_ms>,<speed>\n" where pos=[0..4095], time_ms=[0..65535], speed=[0..1023]
 
 struct UsbGoalParser {
-    static const uint16_t BUF_SIZE = 256;  // Increased from 64
+    static const uint16_t BUF_SIZE = 4096;  // 4KB for TRAJ bulk commands
     char buf[BUF_SIZE];
-    uint16_t idx;  // Increased from uint8_t
+    uint16_t idx;
 };
 
 UsbGoalParser usb_goal = {{0}, 0};
