@@ -17,14 +17,6 @@
  *   - USB: EVT,LOGGING_OFF
  *   - Serial4: Pure binary frames only (no text handshake)
  *
- * Key Changes from Phase 4:
- *   - Non-blocking boot (no Serial4 handshake required)
- *   - Mode state machine with explicit transitions
- *   - SYNCW command for multi-servo control
- *   - READJ command for 6-joint position readback
- *   - Preserved trajectory streaming (G command) in DATA mode
- *
- * Phase: 5 S2B (Mode Manager + Run Control)
  */
 
 #include <Arduino.h>
@@ -46,7 +38,7 @@ void syncw_dispatch_service();
 
 // ============== CONFIGURATION ==============
 #define SAMPLE_RATE_HZ 500
-#define SAMPLE_PERIOD_US (1000000UL / SAMPLE_RATE_HZ)  // 2000 us
+#define SAMPLE_PERIOD_US (1000000UL / SAMPLE_RATE_HZ)  // 000 us
 
 #define SERIAL_CSV_BAUD 2000000  // 2 Mbaud
 #define ENABLE_DEBUG_OUTPUT 0    // 0 = silent, 1 = startup + errors
@@ -100,9 +92,8 @@ volatile bool evt_logging_on_pending  = false;
 volatile bool evt_logging_off_pending = false;
 volatile bool logging_has_written_any = false;  // Set true on first Serial4 write
 
-// Phase-locked goal dispatch (Option B from ServoBUS_Cooperation.md)
-// Set by Frame ISR every 5th frame (100Hz), cleared by servo_write_scheduler()
-volatile bool goal_dispatch_frame_pending = false;
+// NOTE: Phase-locked goal dispatch removed - now using Rate Monotonic scheduler
+// Goal writes handled at 200Hz by rate_monotonic_service()
 
 static inline const char* mode_str(ModeState m) {
     switch(m) {
@@ -113,6 +104,35 @@ static inline const char* mode_str(ModeState m) {
         default: return "?";
     }
 }
+
+// ============== RATE MONOTONIC SCHEDULER ==============
+// Rate Monotonic scheduling: shorter period = higher priority
+// Tasks sorted by period (ascending) for priority ordering
+
+typedef bool (*TaskFn)(void);  // Returns true if work was done
+
+struct ScheduledTask {
+    TaskFn execute;           // Function to call
+    uint32_t period_us;       // Task period in microseconds
+    uint32_t last_run_us;     // Last execution timestamp
+    const char* name;         // Debug name
+    uint32_t exec_count;      // Execution counter
+    uint32_t miss_count;      // Deadline miss counter
+};
+
+// Forward declarations for task functions
+bool dispatch_encoder_read();  // Returns true if encoder read was dispatched
+bool dispatch_goal_write();    // Returns true if goal write was dispatched
+void rate_monotonic_service();
+
+// Tasks sorted by period (ascending) for Rate Monotonic priority
+// Encoder: 500Hz (2000µs) - higher priority (shorter period)
+// Goal: 200Hz (5000µs) - lower priority (longer period)
+ScheduledTask bus_tasks[] = {
+    { dispatch_encoder_read, 2000,  0, "encoder", 0, 0 },  // 500Hz
+    { dispatch_goal_write,   10000, 0, "goal",    0, 0 },  // 100Hz (testing)
+};
+constexpr uint8_t NUM_BUS_TASKS = sizeof(bus_tasks) / sizeof(bus_tasks[0]);
 
 // ============== DATA STRUCTURES ==============
 
@@ -163,6 +183,7 @@ typedef SensorData CSVSample;
 
 struct ServoState {
     volatile int32_t  position;       // Last encoder position (0-4095, or -1 on error)
+    volatile int32_t  velocity;       // Last encoder velocity (from register 0x3A-0x3B)
     volatile uint32_t t_req_us;       // When READ request was sent
     volatile uint32_t t_rx_us;        // When full response was parsed
     volatile uint8_t  error_code;     // 0=OK, 1=timeout, 2=checksum, 3=framing
@@ -172,6 +193,7 @@ struct ServoState {
 // Global shared servo state
 volatile ServoState latest_servo = {
     -1,       // position: invalid
+    0,        // velocity: zero
     0,        // t_req_us
     0,        // t_rx_us
     0xFF,     // error_code: not initialized
@@ -374,8 +396,7 @@ IntervalTimer frameTimer;
 void frame_isr();
 void servo_timeout_service();
 void servo_protocol_fsm();
-void servo_read_service();
-void servo_write_scheduler();
+// dispatch_encoder_read() and dispatch_goal_write() declared with ScheduledTask above
 void usb_goal_service();
 void process_usb_line(const char* line);
 void process_servo_frame(const uint8_t* buf, uint8_t len, uint32_t t_rx);
@@ -478,14 +499,22 @@ bool queue_servo_read_request() {
     return true;
 }
 
-// ============== SERVO READ SERVICE (Called from Main Loop) ==============
+// ============== RATE MONOTONIC TASK: ENCODER READ ==============
+// Called by rate_monotonic_service() at 500Hz
 
-void servo_read_service() {
-    if (!servo_read.request_queued) return;
-    if (servo_read.request_in_flight) return;
-    if (servo_bus.state == BUS_WRITE_WAIT) return;
+bool dispatch_encoder_read() {
+    // Guard: only if request is queued by ISR
+    if (!servo_read.request_queued) return false;  // No work to do
+    if (servo_read.request_in_flight) return false;  // Already in progress
 
-    // Build READ_POSITION request (8 bytes)
+    // Guard: bus must be idle (half-duplex safety)
+    if (servo_bus.state != BUS_IDLE) {
+        bus_tasks[0].miss_count++;  // Track deadline miss
+        return false;  // Bus busy, couldn't dispatch
+    }
+
+    // Build READ_POSITION+VELOCITY request (8 bytes)
+    // Reads 4 bytes from 0x38: Position (0x38-0x39) + Velocity (0x3A-0x3B)
     uint8_t req[8];
     req[0] = FEETECH_HEADER_1;
     req[1] = FEETECH_HEADER_2;
@@ -493,18 +522,19 @@ void servo_read_service() {
     req[3] = 0x04;  // Length
     req[4] = INSTR_READ_DATA;
     req[5] = REG_PRESENT_POSITION_L;
-    req[6] = 0x02;  // Read 2 bytes
+    req[6] = 0x04;  // Read 4 bytes (position + velocity)
     req[7] = calculate_checksum(req, 8);
 
     uint8_t sent = servo_transport_write(req, 8);
     if (sent < 8) {
-        return;
+        return false;  // TX failed
     }
 
     servo_read.current_t_req_us = micros();
     servo_read.request_in_flight = true;
     servo_read.request_queued = false;
     servo_bus.state = BUS_READ_WAIT;
+    return true;  // Work done: encoder read dispatched
 }
 
 // ============== SERVO TIMEOUT SERVICE ==============
@@ -627,10 +657,19 @@ void process_servo_frame(const uint8_t* buf, uint8_t len, uint32_t t_rx) {
         error_code = 3;  // Servo reported error
     }
 
-    if (valid && len >= 8) {
+    // Response format: FF FF ID LEN ERR POS_L POS_H VEL_L VEL_H CHECKSUM (10 bytes)
+    if (valid && len >= 10) {
         int32_t pos = buf[5] | (buf[6] << 8);
 
+        // Feetech velocity format: bit 15 = direction (1=negative), bits 0-14 = magnitude
+        uint16_t vel_raw = buf[7] | (buf[8] << 8);
+        int32_t vel = (vel_raw & 0x7FFF);  // Extract magnitude (bits 0-14)
+        if (vel_raw & 0x8000) {
+            vel = -vel;  // Apply sign if direction bit set
+        }
+
         latest_servo.position = pos;
+        latest_servo.velocity = vel;
         latest_servo.t_req_us = servo_read.current_t_req_us;
         latest_servo.t_rx_us = t_rx;
         latest_servo.error_code = 0;
@@ -1357,26 +1396,21 @@ void usb_goal_service() {
     }
 }
 
-// ============== SERVO WRITE SCHEDULER ==============
+// ============== RATE MONOTONIC TASK: GOAL WRITE ==============
+// Called by rate_monotonic_service() at 200Hz
 
-void servo_write_scheduler() {
-    // Phase-locked dispatch: only on frame-triggered cycles (100Hz)
-    // Replaces rate limiting - see ServoBUS_Cooperation.md
-    if (!goal_dispatch_frame_pending) return;
-
-    // Don't write if read is pending (bus safety)
-    if (servo_bus.state != BUS_IDLE) return;
+bool dispatch_goal_write() {
+    // Guard: bus must be idle (half-duplex safety)
+    if (servo_bus.state != BUS_IDLE) {
+        bus_tasks[1].miss_count++;  // Track deadline miss
+        return false;  // Bus busy, couldn't dispatch
+    }
 
     // Check command queue
     ServoCommand cmd;
     if (!dequeue_goal_cmd(&cmd)) {
-        // Queue empty - clear flag but don't dispatch
-        goal_dispatch_frame_pending = false;
-        return;
+        return false;  // Queue empty, no work to do
     }
-
-    // Clear flag - we're dispatching this cycle
-    goal_dispatch_frame_pending = false;
 
     uint32_t now_us = micros();
 
@@ -1412,6 +1446,40 @@ void servo_write_scheduler() {
 
     servo_rx.state = RX_WAIT_HEADER1;
     servo_rx.idx = 0;
+    return true;  // Work done: goal write dispatched
+}
+
+// ============== RATE MONOTONIC SCHEDULER ==============
+// Services all scheduled bus tasks based on their period
+// Tasks with shorter periods have higher priority (checked first)
+// Only ONE task executes per scheduler call (cooperative scheduling)
+
+void rate_monotonic_service() {
+    uint32_t now_us = micros();
+
+    // Iterate tasks in priority order (sorted by period, ascending)
+    // WORK-CONSERVING: Only count execution if task actually did work
+    for (uint8_t i = 0; i < NUM_BUS_TASKS; i++) {
+        ScheduledTask& task = bus_tasks[i];
+
+        // Check if task is due (period elapsed since last run)
+        uint32_t elapsed = now_us - task.last_run_us;
+
+        if (elapsed >= task.period_us) {
+            // Task is ready to run - check if it has work
+            bool did_work = task.execute();
+
+            if (did_work) {
+                // Work was done: update timestamp and count
+                task.last_run_us = now_us;
+                task.exec_count++;
+                // Only run ONE task per scheduler call (cooperative)
+                return;
+            }
+            // No work done: continue to check lower-priority tasks
+            // (This is the work-conserving fix - don't starve lower priority)
+        }
+    }
 }
 
 // ============== SEQLOCK READER ==============
@@ -1504,12 +1572,8 @@ void frame_isr() {
     // ---- 2) QUEUE SERVO TX ----
     queue_servo_read_request();
 
-    // ---- 2.5) PHASE-LOCKED GOAL DISPATCH (100Hz) ----
-    // Every 5th frame = 10ms intervals, synchronized to sensor sampling
-    // See ServoBUS_Cooperation.md for architecture rationale
-    if ((d.frame_index % 5) == 0) {
-        goal_dispatch_frame_pending = true;
-    }
+    // NOTE: Goal dispatch now handled by rate_monotonic_service() at 200Hz
+    // (removed ISR-coupled phase-locked dispatch)
 
     // ---- 3) SNAPSHOT SERVO STATE ----
     {
@@ -1519,6 +1583,7 @@ void frame_isr() {
         do {
             g1 = latest_servo.generation;
             s.position = latest_servo.position;
+            s.velocity = latest_servo.velocity;
             s.t_req_us = latest_servo.t_req_us;
             s.t_rx_us = latest_servo.t_rx_us;
             s.error_code = latest_servo.error_code;
@@ -1526,6 +1591,7 @@ void frame_isr() {
         } while (g1 != g2);
 
         d.servo_position = s.position;
+        d.servo_velocity = s.velocity;
 
         // Pack queue depth (upper 4 bits) + servo error (lower 4 bits)
         // Queue depth 0-15 (capped), error code 0-3
@@ -1704,12 +1770,13 @@ void setup() {
 
     if (!ISM330::init(imu_cfg)) {
         #if ENABLE_DEBUG_OUTPUT
-        Serial.println("[FATAL] IMU init failed");
+        Serial.println("[WARN] IMU init failed - continuing without IMU");
         #endif
-        while(1) {
-            digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-            delay(500);
-        }
+        // Temporarily disabled fatal halt for servo-only testing
+        // while(1) {
+        //     digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+        //     delay(500);
+        // }
     }
     delay(5);
 
@@ -1820,8 +1887,9 @@ void loop() {
             // Full 500Hz data acquisition pipeline
             servo_protocol_fsm();
             servo_timeout_service();
-            servo_read_service();
-            servo_write_scheduler();
+
+            // Rate Monotonic scheduler handles encoder reads (500Hz) and goal writes (200Hz)
+            rate_monotonic_service();
 
             // Snapshot and log
             {
