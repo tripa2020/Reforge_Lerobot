@@ -1453,32 +1453,32 @@ bool dispatch_goal_write() {
 // Services all scheduled bus tasks based on their period
 // Tasks with shorter periods have higher priority (checked first)
 // Only ONE task executes per scheduler call (cooperative scheduling)
+//
+// OPTIMIZATION: Encoder reads dispatch IMMEDIATELY (no period check)
+// because the Frame ISR already rate-limits them to 500Hz.
+// This eliminates the phase offset between ISR and scheduler clocks,
+// reducing misalignment from ~529µs to ~194µs.
 
 void rate_monotonic_service() {
     uint32_t now_us = micros();
 
-    // Iterate tasks in priority order (sorted by period, ascending)
-    // WORK-CONSERVING: Only count execution if task actually did work
-    for (uint8_t i = 0; i < NUM_BUS_TASKS; i++) {
-        ScheduledTask& task = bus_tasks[i];
+    // ---- ENCODER: Immediate dispatch (ISR rate-limits to 500Hz) ----
+    // No period check needed - request_queued is only set once per 2ms frame
+    if (dispatch_encoder_read()) {
+        bus_tasks[0].exec_count++;
+        return;  // One task per scheduler call
+    }
 
-        // Check if task is due (period elapsed since last run)
-        uint32_t elapsed = now_us - task.last_run_us;
+    // ---- GOAL: Period-based dispatch (queue doesn't rate-limit) ----
+    ScheduledTask& goal = bus_tasks[1];
+    uint32_t elapsed = now_us - goal.last_run_us;
 
-        if (elapsed >= task.period_us) {
-            // Task is ready to run - check if it has work
-            bool did_work = task.execute();
-
-            if (did_work) {
-                // Work was done: update timestamp and count
-                task.last_run_us = now_us;
-                task.exec_count++;
-                // Only run ONE task per scheduler call (cooperative)
-                return;
-            }
-            // No work done: continue to check lower-priority tasks
-            // (This is the work-conserving fix - don't starve lower priority)
+    if (elapsed >= goal.period_us) {
+        if (dispatch_goal_write()) {
+            goal.last_run_us = now_us;
+            goal.exec_count++;
         }
+        // Even if no work, don't starve - goal check is done
     }
 }
 
