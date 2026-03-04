@@ -64,6 +64,8 @@ static const float GYRO_SENS = 4.375f / 1000.0f * (PI / 180.0f);  // +/-125 dps 
 #define FEETECH_HEADER_2 0xFF
 #define INSTR_READ_DATA 0x02
 #define INSTR_WRITE_DATA 0x03
+#define INSTR_REG_WRITE 0x04
+#define INSTR_ACTION 0x05
 #define INSTR_SYNC_WRITE 0x83
 #define REG_TORQUE_ENABLE 0x28
 #define REG_PRESENT_POSITION_L 0x38
@@ -431,6 +433,12 @@ bool set_torque_enable(uint8_t id, bool enable);
 void enable_all_torque();
 void disable_all_torque();
 
+// Atomic write (REG WRITE + ACTION)
+bool reg_write_position(uint8_t id, uint16_t position, uint16_t time_ms, uint16_t speed);
+void send_action_broadcast();
+bool atomic_write_positions(const uint8_t* ids, const uint16_t* positions,
+                            const uint16_t* times, const uint16_t* speeds, uint8_t count);
+
 // ============== SERVO TRANSPORT (Serial3-backed) ==============
 
 static inline uint8_t servo_transport_write(const uint8_t* data, uint8_t len) {
@@ -785,6 +793,80 @@ void disable_all_torque() {
     }
 }
 
+// ============== ATOMIC WRITE (REG WRITE + ACTION) ==============
+
+// Buffer a position command to a single servo (REG WRITE instruction 0x04)
+// Command is stored in servo's buffer but NOT executed until ACTION is sent
+// Returns true if ACK received (command buffered successfully)
+bool reg_write_position(uint8_t id, uint16_t position, uint16_t time_ms, uint16_t speed) {
+    // Packet format: FF FF ID 09 04 2A POS_L POS_H TIME_L TIME_H SPEED_L SPEED_H CHECKSUM
+    uint8_t pkt[13];
+    pkt[0] = FEETECH_HEADER_1;
+    pkt[1] = FEETECH_HEADER_2;
+    pkt[2] = id;
+    pkt[3] = 9;  // Length: instr(1) + addr(1) + data(6) + checksum(1)
+    pkt[4] = INSTR_REG_WRITE;  // 0x04 - buffered write
+    pkt[5] = REG_GOAL_POSITION_L;  // 0x2A
+    pkt[6] = position & 0xFF;
+    pkt[7] = (position >> 8) & 0xFF;
+    pkt[8] = time_ms & 0xFF;
+    pkt[9] = (time_ms >> 8) & 0xFF;
+    pkt[10] = speed & 0xFF;
+    pkt[11] = (speed >> 8) & 0xFF;
+    pkt[12] = calculate_checksum(pkt, 13);
+
+    servo_transport_flush_rx();
+    uint8_t sent = servo_transport_write(pkt, 13);
+
+    if (sent != 13) return false;
+
+    // Wait for ACK (non-broadcast, servo will respond)
+    delay(2);
+
+    // Discard ACK response
+    servo_transport_flush_rx();
+
+    return true;
+}
+
+// Send ACTION broadcast to trigger all buffered REG WRITE commands simultaneously
+// Packet: FF FF FE 02 05 FA (fixed, pre-calculated checksum)
+// No response expected (broadcast ID 0xFE)
+void send_action_broadcast() {
+    uint8_t pkt[6];
+    pkt[0] = FEETECH_HEADER_1;  // 0xFF
+    pkt[1] = FEETECH_HEADER_2;  // 0xFF
+    pkt[2] = 0xFE;              // Broadcast ID
+    pkt[3] = 0x02;              // Length
+    pkt[4] = INSTR_ACTION;      // 0x05
+    pkt[5] = 0xFA;              // Checksum: ~(0xFE + 0x02 + 0x05) = 0xFA
+
+    servo_transport_flush_rx();
+    servo_transport_write(pkt, 6);
+    // No response - broadcast command
+}
+
+// Atomic write to multiple servos using REG WRITE + ACTION
+// All servos buffer their commands first, then ACTION triggers simultaneous execution
+// Drop-in replacement for sync_write_positions() with tighter synchronization
+bool atomic_write_positions(const uint8_t* ids, const uint16_t* positions,
+                            const uint16_t* times, const uint16_t* speeds, uint8_t count) {
+    if (count == 0 || count > 6) return false;
+
+    // 1. Buffer commands to all servos (no movement yet)
+    for (uint8_t i = 0; i < count; i++) {
+        if (!reg_write_position(ids[i], positions[i], times[i], speeds[i])) {
+            return false;  // Failed to buffer
+        }
+        // ACK received = servo has buffered command, continue to next
+    }
+
+    // 2. Trigger ALL servos simultaneously
+    send_action_broadcast();
+
+    return true;
+}
+
 // SYNCW dispatch service - called from loop() in MODE_MOVE
 // Dispatches queued waypoints at 100Hz (10ms intervals) using micros() timer
 void syncw_dispatch_service() {
@@ -810,8 +892,8 @@ void syncw_dispatch_service() {
             speeds[i] = entry.speed;
         }
 
-        // Execute SYNC WRITE to servos
-        sync_write_positions(ids, entry.positions, times, speeds, 5);
+        // Execute atomic write (REG WRITE + ACTION) to servos
+        atomic_write_positions(ids, entry.positions, times, speeds, 5);
 
         syncw_dispatched_count++;
 
@@ -1321,9 +1403,9 @@ void process_usb_line(const char* line) {
             return;
         }
 
-        // Immediate execute (legacy mode or non-5-joint commands)
-        bool ok = sync_write_positions(ids, positions, times, speeds, (uint8_t)count);
-        Serial.println(ok ? "OK" : "ERR,SYNCW_FAIL");
+        // Immediate execute using atomic write (REG WRITE + ACTION)
+        bool ok = atomic_write_positions(ids, positions, times, speeds, (uint8_t)count);
+        Serial.println(ok ? "OK" : "ERR,ATOMICW_FAIL");
         return;
     }
 
@@ -1476,10 +1558,10 @@ void process_usb_line(const char* line) {
         if (timeout > 30000) timeout = 30000;
         uint32_t timeout_ms = (uint32_t)timeout;
 
-        // Execute SYNC WRITE
-        bool ok = sync_write_positions(ids, positions, times, speeds, (uint8_t)count);
+        // Execute atomic write (REG WRITE + ACTION)
+        bool ok = atomic_write_positions(ids, positions, times, speeds, (uint8_t)count);
         if (!ok) {
-            Serial.println("ERR,SYNCW_FAIL");
+            Serial.println("ERR,ATOMICW_FAIL");
             return;
         }
 
