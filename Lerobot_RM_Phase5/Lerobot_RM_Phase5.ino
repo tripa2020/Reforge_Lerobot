@@ -65,6 +65,7 @@ static const float GYRO_SENS = 4.375f / 1000.0f * (PI / 180.0f);  // +/-125 dps 
 #define INSTR_READ_DATA 0x02
 #define INSTR_WRITE_DATA 0x03
 #define INSTR_SYNC_WRITE 0x83
+#define REG_TORQUE_ENABLE 0x28
 #define REG_PRESENT_POSITION_L 0x38
 #define REG_GOAL_POSITION_L 0x2A
 
@@ -425,6 +426,11 @@ bool sync_write_positions(const uint8_t* ids, const uint16_t* positions,
                           const uint16_t* times, const uint16_t* speeds, uint8_t count);
 int16_t read_servo_position_blocking(uint8_t id);
 
+// Torque control
+bool set_torque_enable(uint8_t id, bool enable);
+void enable_all_torque();
+void disable_all_torque();
+
 // ============== SERVO TRANSPORT (Serial3-backed) ==============
 
 static inline uint8_t servo_transport_write(const uint8_t* data, uint8_t len) {
@@ -736,6 +742,49 @@ bool sync_write_positions(const uint8_t* ids, const uint16_t* positions,
     return (sent == idx);
 }
 
+// ============== TORQUE CONTROL ==============
+
+// Enable or disable torque for a single servo
+// Returns true if command sent successfully
+bool set_torque_enable(uint8_t id, bool enable) {
+    uint8_t pkt[8];
+    pkt[0] = FEETECH_HEADER_1;
+    pkt[1] = FEETECH_HEADER_2;
+    pkt[2] = id;
+    pkt[3] = 4;  // Length: INSTR + ADDR + DATA + CHECKSUM
+    pkt[4] = INSTR_WRITE_DATA;
+    pkt[5] = REG_TORQUE_ENABLE;
+    pkt[6] = enable ? 1 : 0;
+    pkt[7] = calculate_checksum(pkt, 8);
+
+    servo_transport_flush_rx();
+    uint8_t sent = servo_transport_write(pkt, 8);
+
+    // Wait for ACK (non-broadcast command)
+    delay(2);
+
+    // Discard response
+    servo_transport_flush_rx();
+
+    return (sent == 8);
+}
+
+// Enable torque on all servos (IDs 1-6)
+void enable_all_torque() {
+    for (uint8_t id = 1; id <= 6; id++) {
+        set_torque_enable(id, true);
+        delay(5);
+    }
+}
+
+// Disable torque on all servos (IDs 1-6)
+void disable_all_torque() {
+    for (uint8_t id = 1; id <= 6; id++) {
+        set_torque_enable(id, false);
+        delay(5);
+    }
+}
+
 // SYNCW dispatch service - called from loop() in MODE_MOVE
 // Dispatches queued waypoints at 100Hz (10ms intervals) using micros() timer
 void syncw_dispatch_service() {
@@ -769,7 +818,7 @@ void syncw_dispatch_service() {
         // Check if we've dispatched expected count
         if (syncw_dispatched_count >= syncw_expected_count) {
             syncw_dispatch_enabled = false;
-            Serial.println("EVT,MOVE_DONE");
+            emit_move_result();  // Report final positions and error flags
         }
     }
 }
@@ -808,6 +857,166 @@ int16_t read_servo_position_blocking(uint8_t id) {
         }
     }
     return -1;  // Error or timeout
+}
+
+// Read servo hardware error register 0x41 (blocking)
+// Returns: error flags byte, or 0xFF on read failure
+// Bit 0: Input voltage error (ignored by Python)
+// Bit 1: Angle limit error
+// Bit 2: Overheating error
+// Bit 3: Overload error
+uint8_t read_servo_error_register_blocking(uint8_t id) {
+    uint8_t req[8];
+    req[0] = FEETECH_HEADER_1;
+    req[1] = FEETECH_HEADER_2;
+    req[2] = id;
+    req[3] = 0x04;              // Length: instruction + addr + len + checksum
+    req[4] = INSTR_READ_DATA;   // 0x02
+    req[5] = 0x41;              // Error register address
+    req[6] = 0x01;              // Read 1 byte
+    req[7] = calculate_checksum(req, 8);
+
+    servo_transport_flush_rx();
+    servo_transport_write(req, 8);
+
+    // Wait for response: FF FF ID 03 ERR DATA CHECKSUM (7 bytes)
+    uint32_t start = micros();
+    uint8_t buf[16];
+    uint8_t idx = 0;
+
+    while ((micros() - start) < 2000 && idx < 7) {
+        if (Serial3.available()) {
+            buf[idx++] = Serial3.read();
+        }
+    }
+
+    // Parse response
+    if (idx >= 7 && buf[0] == 0xFF && buf[1] == 0xFF && buf[2] == id) {
+        uint8_t calc = calculate_checksum(buf, 7);
+        if (buf[6] == calc && buf[4] == 0x00) {  // Protocol OK
+            return buf[5];  // Error flags byte
+        }
+    }
+    return 0xFF;  // Read failed
+}
+
+// Wait for all servos J1-J5 to stop moving
+// Returns true if settled, false if timeout
+// Criteria: ALL servos must be stable for STABLE_DURATION_MS after last movement
+// Uses global stability timer - waits 500ms after the LAST servo stops
+// Timeout: 16 seconds (π rad / 0.2 rad/s worst case)
+// Poll rate: 50Hz (20ms intervals)
+bool wait_for_servos_settled(uint32_t timeout_ms) {
+    const uint8_t SERVO_COUNT = 5;
+    const uint32_t POLL_INTERVAL_MS = 20;
+    const uint32_t STABLE_DURATION_MS = 500;
+    const uint32_t MOTION_START_TIMEOUT_MS = 500;
+
+    int16_t last_positions[SERVO_COUNT];
+    bool servo_started[SERVO_COUNT] = {false, false, false, false, false};
+    uint32_t global_stable_start_ms = 0;
+
+    // Read initial positions
+    for (uint8_t id = 1; id <= SERVO_COUNT; id++) {
+        last_positions[id - 1] = read_servo_position_blocking(id);
+    }
+
+    uint32_t start_ms = millis();
+
+    while ((millis() - start_ms) < timeout_ms) {
+        bool all_stable = true;
+
+        for (uint8_t id = 1; id <= SERVO_COUNT; id++) {
+            uint8_t idx = id - 1;
+
+            int16_t pos = read_servo_position_blocking(id);
+            if (pos < 0) {
+                all_stable = false;
+                continue;
+            }
+
+            // Check if servo has started moving
+            if (!servo_started[idx]) {
+                if (pos != last_positions[idx]) {
+                    servo_started[idx] = true;
+                } else if ((millis() - start_ms) > MOTION_START_TIMEOUT_MS) {
+                    servo_started[idx] = true;
+                }
+            }
+
+            // Any position change resets global stability
+            if (pos != last_positions[idx]) {
+                all_stable = false;
+            }
+
+            last_positions[idx] = pos;
+        }
+
+        // Check if all servos have started
+        bool all_started = true;
+        for (uint8_t i = 0; i < SERVO_COUNT; i++) {
+            if (!servo_started[i]) all_started = false;
+        }
+
+        if (all_started && all_stable) {
+            if (global_stable_start_ms == 0) {
+                global_stable_start_ms = millis();
+            } else if ((millis() - global_stable_start_ms) >= STABLE_DURATION_MS) {
+                return true;
+            }
+        } else {
+            global_stable_start_ms = 0;
+        }
+
+        delay(POLL_INTERVAL_MS);
+    }
+
+    return false;
+}
+
+// Emit EVT,MOVE_RESULT with positions and error flags for all 5 servos
+// Format: EVT,MOVE_RESULT,pos1,pos2,pos3,pos4,pos5,0xf1,0xf2,0xf3,0xf4,0xf5
+// Python checks: |pos - goal| > 5 -> SETTLE error, flags & 0x0E -> motor error
+void emit_move_result() {
+    // Wait for servos to stop moving (global stability timer)
+    wait_for_servos_settled(16000);
+
+    // Additional 1 second settling for micro-adjustments
+    delay(1000);
+
+    int16_t positions[5];
+    uint8_t flags[5];
+
+    // Read positions 5 times consecutively, use final reading
+    for (uint8_t read_cycle = 0; read_cycle < 5; read_cycle++) {
+        for (uint8_t id = 1; id <= 5; id++) {
+            positions[id - 1] = read_servo_position_blocking(id);
+        }
+        if (read_cycle < 4) delay(50);
+    }
+
+    // Read error registers once
+    for (uint8_t id = 1; id <= 5; id++) {
+        flags[id - 1] = read_servo_error_register_blocking(id);
+    }
+
+    // Emit result line
+    Serial.print("EVT,MOVE_RESULT");
+
+    // Positions (decimal)
+    for (uint8_t i = 0; i < 5; i++) {
+        Serial.print(",");
+        Serial.print(positions[i]);
+    }
+
+    // Error flags (hex format with 0x prefix)
+    for (uint8_t i = 0; i < 5; i++) {
+        Serial.print(",0x");
+        if (flags[i] < 0x10) Serial.print("0");
+        Serial.print(flags[i], HEX);
+    }
+
+    Serial.println();
 }
 
 // ============== MODE TRANSITION FUNCTIONS ==============
@@ -963,6 +1172,50 @@ void process_usb_line(const char* line) {
         Serial.print("SERVO,");
         Serial.print(g_stream_servo_id);
         Serial.println(",OK");
+        return;
+    }
+
+    // TORQUE,ON - enable torque on all servos
+    if (!strcmp(line, "TORQUE,ON")) {
+        enable_all_torque();
+        Serial.println("TORQUE,ON,OK");
+        return;
+    }
+
+    // TORQUE,OFF - disable torque on all servos
+    if (!strcmp(line, "TORQUE,OFF")) {
+        disable_all_torque();
+        Serial.println("TORQUE,OFF,OK");
+        return;
+    }
+
+    // TORQUE,<id>,ON/OFF - control single servo torque
+    if (!strncmp(line, "TORQUE,", 7)) {
+        const char* p = line + 7;
+        char* end;
+        long id = strtol(p, &end, 10);
+        if (end == p || id < 1 || id > 6) {
+            Serial.println("ERR,TORQUE_ID_INVALID");
+            return;
+        }
+        if (*end != ',') {
+            Serial.println("ERR,TORQUE_PARSE");
+            return;
+        }
+        p = end + 1;
+        if (!strcmp(p, "ON")) {
+            set_torque_enable((uint8_t)id, true);
+            Serial.print("TORQUE,");
+            Serial.print(id);
+            Serial.println(",ON,OK");
+        } else if (!strcmp(p, "OFF")) {
+            set_torque_enable((uint8_t)id, false);
+            Serial.print("TORQUE,");
+            Serial.print(id);
+            Serial.println(",OFF,OK");
+        } else {
+            Serial.println("ERR,TORQUE_VALUE_INVALID");
+        }
         return;
     }
 
@@ -1758,8 +2011,14 @@ void setup() {
 
     // Servo UART
     Serial3.begin(SERVO_BAUD);
+    delay(100);
+
+    // Enable torque on all servos at boot
+    enable_all_torque();
+
     #if ENABLE_DEBUG_OUTPUT
     Serial.println("Serial3 initialized @ 1 Mbaud");
+    Serial.println("Torque enabled on servos 1-6");
     #endif
 
     // Initialize IMU
@@ -1808,6 +2067,8 @@ void setup() {
     Serial.println("  READJ             - read 6 joints (MOVE)");
     Serial.println("  MOVE,n,id,p,t,s,..,tol,timeout - blocking move (MOVE)");
     Serial.println("  G,pos,time,spd    - goal stream (DATA_RUN)");
+    Serial.println("  TORQUE,ON/OFF     - enable/disable all servo torque");
+    Serial.println("  TORQUE,<id>,ON/OFF - control single servo torque");
     Serial.println("Events: EVT,LOGGING_ON / EVT,LOGGING_OFF");
     Serial.println("");
     Serial.println("Waiting for MODE command...");
