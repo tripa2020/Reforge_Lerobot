@@ -159,4 +159,26 @@ inline void readRaw(RawSample& out) {
     );
 }
 
+// ===== Soft Reset (callable after init) =====
+//
+// Resets IMU registers and reconfigures. Use for recovery after SPI failure.
+// Returns: true if WHO_AM_I reads 0x6B after reset
+
+inline bool softReset() {
+    // 1. SW_RESET bit (self-clearing)
+    writeReg(REG_CTRL3_C, 0x01);
+    delayMicroseconds(100);  // Wait for reset to complete
+
+    // 2. Reconfigure (same sequence as init)
+    writeReg(REG_CTRL3_C, 0x44);  // BDU + IF_INC
+    writeReg(REG_CTRL4_C, 0x04);  // I2C disable
+    writeReg(REG_CTRL9_XL, 0x02); // DEVICE_CONF
+    writeReg(REG_CTRL1_XL, 0x50); // Accel 208Hz, ±2g
+    writeReg(REG_CTRL2_G, 0x58);  // Gyro 208Hz, ±125dps
+
+    // 3. Verify WHO_AM_I
+    uint8_t who = readReg(REG_WHO_AM_I);
+    return (who == 0x6B);
+}
+
 } // namespace ISM330

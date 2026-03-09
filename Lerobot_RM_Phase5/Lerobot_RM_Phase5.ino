@@ -95,6 +95,20 @@ volatile bool evt_logging_on_pending  = false;
 volatile bool evt_logging_off_pending = false;
 volatile bool logging_has_written_any = false;  // Set true on first Serial4 write
 
+// IMU dropout detection (Phase 1.5) and firmware-first recovery (Phase 2)
+// Status codes: 0x00=OK, 0x01=SPI_TIMEOUT, 0x02=FROZEN, 0x03=ALL_ZEROS
+volatile uint32_t g_imu_consecutive_failures = 0;
+volatile uint32_t g_imu_dropout_frame = 0;      // Frame index when dropout detected
+volatile bool evt_imu_dropout_pending = false;
+const uint32_t IMU_DROPOUT_THRESHOLD = 1250;    // 5 seconds at 250Hz
+
+// Firmware-first IMU recovery (Phase 2)
+// ISR sets flag, main loop tries softReset() up to 3x before escalating to Python
+volatile bool imu_reset_requested = false;
+volatile uint8_t imu_reset_attempts = 0;
+volatile bool imu_gave_up = false;              // Once escalated to Python, stop retrying
+const uint8_t IMU_MAX_RESET_ATTEMPTS = 3;
+
 // NOTE: Phase-locked goal dispatch removed - now using Rate Monotonic scheduler
 // Goal writes handled at 200Hz by rate_monotonic_service()
 
@@ -1320,6 +1334,46 @@ void process_usb_line(const char* line) {
         return;
     }
 
+    // IMU,RESET - soft reset IMU (Phase 1.5)
+    // Stops ISR, resets IMU, restarts ISR, clears dropout state
+    if (!strcmp(line, "IMU,RESET")) {
+        // Must stop ISR during reset (SPI transaction can't be interrupted)
+        bool was_running = (g_mode == MODE_DATA_RUN);
+        if (was_running) {
+            frameTimer.end();
+            logging_active = false;
+            delayMicroseconds(100);  // Let any in-flight ISR complete
+        }
+
+        bool ok = ISM330::softReset();
+
+        // Clear dropout state (including firmware-first recovery state)
+        g_imu_consecutive_failures = 0;
+        evt_imu_dropout_pending = false;
+        imu_reset_requested = false;
+        imu_reset_attempts = 0;
+
+        if (was_running) {
+            // Restart ISR
+            frameTimer.begin(frame_isr, SAMPLE_PERIOD_US);
+            frameTimer.priority(32);
+            logging_active = true;
+        }
+
+        Serial.println(ok ? "IMU,RESET,OK" : "IMU,RESET,FAIL");
+        return;
+    }
+
+    // TEENSY,RESET - full software reset (Phase 1.5)
+    // Reboots entire Teensy, USB will disconnect/reconnect
+    if (!strcmp(line, "TEENSY,RESET")) {
+        Serial.println("TEENSY,RESET,OK");
+        Serial.flush();
+        delay(10);  // Allow USB to flush
+        SCB_AIRCR = 0x05FA0004;  // ARM Cortex-M7 software reset
+        // Execution stops here - Teensy reboots
+    }
+
     // ===== Mode-Required Commands =====
 
     if (g_mode == MODE_WAIT) {
@@ -1921,6 +1975,27 @@ void frame_isr() {
     d.gyro_z_rads = raw.gz * GYRO_SENS;
     d.imu_read_us = imu_end - imu_start;
 
+    // ---- 2b) IMU DROPOUT DETECTION ----
+    // Status: 0x00=OK, 0x03=ALL_ZEROS (other codes reserved for future)
+    uint8_t imu_status = 0x00;
+    if (!raw.valid) {
+        imu_status = 0x03;  // All zeros detected
+        g_imu_consecutive_failures++;
+
+        // Check threshold and request firmware recovery (once per dropout)
+        // Main loop will try softReset() up to 3x before escalating to Python
+        // imu_gave_up prevents re-triggering after escalation (cleared by Teensy reset)
+        if (g_imu_consecutive_failures >= IMU_DROPOUT_THRESHOLD &&
+            !imu_reset_requested && !evt_imu_dropout_pending && !imu_gave_up) {
+            g_imu_dropout_frame = d.frame_index;
+            imu_reset_requested = true;
+            imu_reset_attempts = 0;
+        }
+    } else {
+        g_imu_consecutive_failures = 0;  // Reset on valid sample
+    }
+    d.reserved[0] = imu_status;  // Pack status into frame
+
     // ---- 3) QUEUE SERVO TX ----
     queue_servo_read_request();
 
@@ -1966,7 +2041,8 @@ void frame_isr() {
     d.coherency_flag = 0xAA;
 
     // ---- 7) RESERVED BYTES ----
-    memset(d.reserved, 0, 8);
+    // Note: reserved[0] = imu_status (set in step 2b), preserve it
+    memset(&d.reserved[1], 0, 7);
 
     // ---- 8) CRC16 field (zeroed - CRC validation disabled) ----
     d.crc16 = 0;
@@ -2265,6 +2341,43 @@ void loop() {
             if (evt_logging_on_pending && logging_has_written_any) {
                 Serial.println("EVT,LOGGING_ON");
                 evt_logging_on_pending = false;
+            }
+
+            // ===== FIRMWARE-FIRST IMU RECOVERY (Phase 2) =====
+            // ISR detected dropout (250 frames) and set imu_reset_requested
+            // Main loop tries softReset() up to 3x before escalating to Python
+            if (imu_reset_requested) {
+                // Pause ISR during reset (softReset uses delay)
+                frameTimer.end();
+                delay(1);  // Let any in-flight SPI complete
+
+                bool ok = ISM330::softReset();
+                imu_reset_attempts++;
+
+                // Resume ISR
+                frameTimer.begin(frame_isr, SAMPLE_PERIOD_US);
+
+                if (ok) {
+                    // SUCCESS - firmware recovered, continue streaming
+                    g_imu_consecutive_failures = 0;
+                    imu_reset_requested = false;
+                    Serial.println("EVT,IMU_RECOVERED");
+                } else if (imu_reset_attempts >= IMU_MAX_RESET_ATTEMPTS) {
+                    // ESCALATE - firmware can't fix it, notify Python
+                    evt_imu_dropout_pending = true;
+                    imu_reset_requested = false;
+                    imu_gave_up = true;  // Stop retrying until Teensy reset
+                } else {
+                    // Retry next loop iteration (10ms delay between attempts)
+                    delay(10);
+                }
+            }
+
+            // IMU dropout event - only emitted after firmware tried 3x and failed
+            if (evt_imu_dropout_pending) {
+                Serial.print("EVT,IMU_DROPOUT,");
+                Serial.println(g_imu_dropout_frame);
+                evt_imu_dropout_pending = false;
             }
             break;
     }

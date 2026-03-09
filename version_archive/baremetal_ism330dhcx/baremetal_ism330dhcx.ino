@@ -4,6 +4,12 @@
 
 IntervalTimer imuTimer;
 
+// Stats for tracking failures and resets
+volatile uint32_t g_imu_failures = 0;
+volatile uint32_t g_imu_resets = 0;
+volatile uint32_t g_consecutive_failures = 0;
+volatile uint32_t g_total_samples = 0;
+
 // Shared sample + seqlock-ish generation counter
 struct SharedSample {
     uint32_t seq;
@@ -21,7 +27,16 @@ void imuISR() {
     ISM330::RawSample s;
     ISM330::readRaw(s);
 
-    // 3) publish with simple sequence counter
+    // 3) track failures (all zeros = likely SPI failure or power loss)
+    g_total_samples++;
+    if (!s.valid) {
+        g_imu_failures++;
+        g_consecutive_failures++;
+    } else {
+        g_consecutive_failures = 0;
+    }
+
+    // 4) publish with simple sequence counter
     // Manual field-by-field copy to avoid volatile struct assignment issues
     g_shared.seq++;
     g_shared.ts_us = t;
@@ -54,11 +69,59 @@ void setup() {
 
     g_shared.seq = 0;
 
-    imuTimer.begin(imuISR, 2000.0); // 500 Hz
+    imuTimer.begin(imuISR, 4000.0); // 250 Hz (matches production)
+
+    Serial.println("\n===== IMU Reset Test Sketch =====");
+    Serial.println("Commands: R=IMU reset, T=Teensy reset, S=Stats, H=Help");
+    Serial.println("=================================\n");
 }
 
 void loop() {
-    // Snapshot with simple seqlock
+    // ===== Command Handler =====
+    if (Serial.available()) {
+        char cmd = Serial.read();
+
+        if (cmd == 'R' || cmd == 'r') {
+            // IMU soft reset test
+            imuTimer.end();  // Stop ISR during reset
+            delay(1);        // Let any in-flight SPI complete
+
+            bool ok = ISM330::softReset();
+            g_imu_resets++;
+            g_consecutive_failures = 0;  // Reset counter
+
+            imuTimer.begin(imuISR, 4000.0);  // Resume at 250Hz
+            Serial.println(ok ? "IMU_RESET,OK" : "IMU_RESET,FAIL");
+        }
+        else if (cmd == 'T' || cmd == 't') {
+            // Teensy full software reset
+            Serial.println("TEENSY_RESET,OK");
+            Serial.flush();
+            delay(10);  // Allow USB to flush
+            SCB_AIRCR = 0x05FA0004;  // ARM Cortex-M7 software reset
+            // Execution stops here - Teensy reboots
+        }
+        else if (cmd == 'S' || cmd == 's') {
+            // Print stats
+            Serial.println("===== IMU STATS =====");
+            Serial.print("total_samples=");    Serial.println(g_total_samples);
+            Serial.print("failures=");         Serial.println(g_imu_failures);
+            Serial.print("consecutive_fail="); Serial.println(g_consecutive_failures);
+            Serial.print("resets=");           Serial.println(g_imu_resets);
+            Serial.print("valid_now=");        Serial.println(g_shared.raw.valid ? "YES" : "NO");
+            Serial.println("=====================");
+        }
+        else if (cmd == 'H' || cmd == 'h' || cmd == '?') {
+            // Help
+            Serial.println("Commands:");
+            Serial.println("  R - IMU soft reset (CTRL3_C SW_RESET)");
+            Serial.println("  T - Teensy full reset (SCB_AIRCR)");
+            Serial.println("  S - Print stats");
+            Serial.println("  H - This help");
+        }
+    }
+
+    // ===== Snapshot with simple seqlock =====
     SharedSample snap;
     uint32_t s1, s2;
     do {
@@ -91,7 +154,9 @@ void loop() {
     float gy = snap.raw.gy * GYRO_SENS;
     float gz = snap.raw.gz * GYRO_SENS;
 
-    Serial.print("t_us=");
+    // Print with valid flag
+    Serial.print(snap.raw.valid ? "[OK] " : "[FAIL] ");
+    Serial.print("t=");
     Serial.print(snap.ts_us);
     Serial.print(" A[");
     Serial.print(ax, 3); Serial.print(", ");
@@ -99,7 +164,12 @@ void loop() {
     Serial.print(az, 3); Serial.print("]  G[");
     Serial.print(gx, 3); Serial.print(", ");
     Serial.print(gy, 3); Serial.print(", ");
-    Serial.print(gz, 3); Serial.println("]");
+    Serial.print(gz, 3); Serial.print("]");
+    if (g_consecutive_failures > 0) {
+        Serial.print(" consec_fail=");
+        Serial.print(g_consecutive_failures);
+    }
+    Serial.println();
 
-    delay(50); // just for readability
+    delay(100); // slower print rate for readability
 }
