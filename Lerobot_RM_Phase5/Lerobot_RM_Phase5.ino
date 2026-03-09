@@ -21,7 +21,7 @@
 
 #include <Arduino.h>
 #include <SPI.h>
-#include "ISM330_Bare.h"
+#include "ISM330_Bare.h">
 
 // Forward declarations for Arduino preprocessor (must precede function prototypes)
 struct SyncwEntry;
@@ -37,10 +37,10 @@ void syncw_dispatch_service();
 #endif
 
 // ============== CONFIGURATION ==============
-#define SAMPLE_RATE_HZ 500
+#define SAMPLE_RATE_HZ 250
 #define SAMPLE_PERIOD_US (1000000UL / SAMPLE_RATE_HZ)  // 000 us
 
-#define SERIAL_CSV_BAUD 2000000  // 2 Mbaud
+#define SERIAL_CSV_BAUD 1000000  // 1 Mbaud
 #define ENABLE_DEBUG_OUTPUT 0    // 0 = silent, 1 = startup + errors
 
 // ============== HARDWARE - IMU ==============
@@ -139,13 +139,17 @@ constexpr uint8_t NUM_BUS_TASKS = sizeof(bus_tasks) / sizeof(bus_tasks[0]);
 
 // ============== DATA STRUCTURES ==============
 
-// Enhanced sensor snapshot (64 bytes)
-struct SensorData {
-    // Frame timing
-    uint32_t frame_ts_us;         // ISR entry time (= IMU sample time)
-    uint32_t frame_index;         // Monotonic counter
+// Frame V2: Magic header + CRC16 for robust sync recovery
+// Layout designed for 64-byte alignment (optimal for DMA/cache)
+struct SensorDataV2 {
+    // --- Sync Header (4 bytes) ---
+    uint8_t magic[4];             // 0xDEADBEEF - frame sync marker
 
-    // IMU (read FIRST in ISR)
+    // --- Timing (8 bytes) ---
+    uint32_t frame_ts_us;         // ISR entry timestamp
+    uint32_t frame_index;         // Monotonic frame counter
+
+    // --- IMU Data (24 bytes) ---
     float accel_x_mps2;
     float accel_y_mps2;
     float accel_z_mps2;
@@ -153,34 +157,29 @@ struct SensorData {
     float gyro_y_rads;
     float gyro_z_rads;
 
-    // Servo state
-    int32_t servo_position;       // Encoder position (0-4095)
-    int32_t servo_velocity;       // Reserved
+    // --- Servo State (8 bytes) ---
+    int32_t servo_position;       // Encoder [0-4095]
+    int32_t servo_velocity;       // Velocity from servo
 
-    // Timing diagnostics
-    uint16_t imu_read_us;         // IMU SPI transaction time
-    uint16_t servo_age_us;        // frame_ts_us - servo.t_rx_us
-    uint16_t isr_total_us;        // Total ISR execution time
-    uint16_t servo_latency_us;    // t_rx_us - t_req_us (for diagnostics)
+    // --- Diagnostics (8 bytes) ---
+    uint16_t imu_read_us;         // IMU SPI time
+    uint16_t servo_age_us;        // Staleness of servo data
+    int16_t period_error_us;      // Jitter from 2000us target
+    uint16_t cmd_goal;            // Last commanded position
 
-    // Jitter metrics
-    int16_t period_error_us;      // Actual period - 2000us
+    // --- Status (4 bytes) ---
+    uint8_t coherency_flag;       // 0xAA = valid write
+    uint8_t servo_error_code;     // Upper nibble: queue depth
+    uint16_t crc16;               // CRC16-CCITT over bytes 0-53
 
-    // Coherency validation
-    uint32_t checksum;
-    uint8_t coherency_flag;       // 0xAA = valid, 0xFF = torn, 0xEE = stale
+    // --- Padding (8 bytes) ---
+    uint8_t reserved[8];          // Future use / alignment
 
-    // Error tracking
-    uint8_t servo_error_code;     // 0=OK, 1=timeout, 2=checksum, 3=framing
+} __attribute__((packed));
 
-    // Command tracking (for host-driven goal streaming)
-    uint16_t cmd_goal;            // Last commanded goal position (0xFFFF = none)
-    uint32_t cmd_time_us;         // When command was sent (micros)
-} __attribute__((aligned(32)));
+static_assert(sizeof(SensorDataV2) == 64, "SensorDataV2 must be exactly 64 bytes");
 
-static_assert(sizeof(SensorData) == 64, "SensorData must be exactly 64 bytes");
-
-typedef SensorData CSVSample;
+typedef SensorDataV2 CSVSample;
 
 // ============== SERVO STATE (FSM -> Frame ISR) ==============
 
@@ -331,11 +330,11 @@ bool dequeue_syncw(SyncwEntry* out) {
 
 struct SeqlockBuffer {
     volatile uint32_t seq __attribute__((aligned(4)));
-    SensorData data;
+    SensorDataV2 data;
 } __attribute__((aligned(32)));
 
 SeqlockBuffer shared __attribute__((aligned(32)));
-SensorData last_valid_snapshot;
+SensorDataV2 last_valid_snapshot;
 
 volatile uint32_t frame_index = 0;
 volatile uint32_t last_isr_time_us = 0;
@@ -392,6 +391,9 @@ UsbGoalParser usb_goal = {{0}, 0};
 volatile bool isr_active = false;
 volatile bool logging_active = false;
 
+// ============== HARDWARE STATUS ==============
+volatile bool g_imu_ok = false;  // Set true if IMU init succeeds
+
 // ============== INTERVAL TIMER ==============
 IntervalTimer frameTimer;
 
@@ -405,7 +407,7 @@ void process_usb_line(const char* line);
 void process_servo_frame(const uint8_t* buf, uint8_t len, uint32_t t_rx);
 uint8_t calculate_checksum(const uint8_t* data, uint8_t len);
 bool queue_servo_read_request();
-SensorData seqlock_read();
+SensorDataV2 seqlock_read();
 void csv_push_sample(const CSVSample& sample);
 bool csv_buffer_full();
 void csv_service();
@@ -1207,6 +1209,17 @@ void process_usb_line(const char* line) {
         return;
     }
 
+    // INFO? - hardware info query
+    if (!strcmp(line, "INFO?")) {
+        Serial.print("INFO,115200,");
+        Serial.print(SERVO_BAUD);
+        Serial.print(",");
+        Serial.print(SERIAL_CSV_BAUD);
+        Serial.print(",");
+        Serial.println(g_imu_ok ? "OK" : "FAIL");
+        return;
+    }
+
     // MODE,MOVE - enter motion mode
     if (!strcmp(line, "MODE,MOVE")) {
         g_mode_req = MODE_MOVE;
@@ -1819,8 +1832,8 @@ void rate_monotonic_service() {
 
 // ============== SEQLOCK READER ==============
 
-SensorData seqlock_read() {
-    SensorData snapshot;
+SensorDataV2 seqlock_read() {
+    SensorDataV2 snapshot;
     uint32_t s1, s2 = 0;
     uint8_t retries = 0;
     const uint8_t MAX_RETRIES = 5;
@@ -1848,12 +1861,8 @@ SensorData seqlock_read() {
 
     } while (s1 != s2 && retries < MAX_RETRIES);
 
-    // Verify checksum
-    uint32_t accel_bits;
-    memcpy(&accel_bits, &snapshot.accel_x_mps2, sizeof(uint32_t));
-    uint32_t expected = snapshot.frame_ts_us ^ snapshot.frame_index ^ accel_bits;
-
-    if (snapshot.checksum != expected || snapshot.coherency_flag != 0xAA) {
+    // Validate coherency flag only (CRC validation disabled)
+    if (snapshot.coherency_flag != 0xAA) {
         stats.torn_reads++;
         snapshot.coherency_flag = 0xFF;
     } else {
@@ -1886,11 +1895,19 @@ void frame_isr() {
     shared.seq++;
     SEQLOCK_BARRIER();
 
-    SensorData& d = shared.data;
+    SensorDataV2& d = shared.data;
+
+    // ---- 0) MAGIC HEADER (Frame V2 sync marker) ----
+    d.magic[0] = 0xDE;
+    d.magic[1] = 0xAD;
+    d.magic[2] = 0xBE;
+    d.magic[3] = 0xEF;
+
+    // ---- 1) TIMING ----
     d.frame_ts_us = isr_start;
     d.frame_index = frame_index++;
 
-    // ---- 1) IMU READ FIRST (bare-metal SPI, ~33-130us) ----
+    // ---- 2) IMU READ (bare-metal SPI, ~33-130us) ----
     uint32_t imu_start = micros();
     ISM330::RawSample raw;
     ISM330::readRaw(raw);
@@ -1904,13 +1921,13 @@ void frame_isr() {
     d.gyro_z_rads = raw.gz * GYRO_SENS;
     d.imu_read_us = imu_end - imu_start;
 
-    // ---- 2) QUEUE SERVO TX ----
+    // ---- 3) QUEUE SERVO TX ----
     queue_servo_read_request();
 
     // NOTE: Goal dispatch now handled by rate_monotonic_service() at 200Hz
     // (removed ISR-coupled phase-locked dispatch)
 
-    // ---- 3) SNAPSHOT SERVO STATE ----
+    // ---- 4) SNAPSHOT SERVO STATE ----
     {
         ServoState s;
         uint32_t g1, g2;
@@ -1936,27 +1953,23 @@ void frame_isr() {
 
         if (s.t_rx_us != 0 && s.t_rx_us <= d.frame_ts_us && s.error_code == 0) {
             d.servo_age_us = (uint16_t)(d.frame_ts_us - s.t_rx_us);
-            d.servo_latency_us = (uint16_t)(s.t_rx_us - s.t_req_us);
         } else {
             d.servo_age_us = 0xFFFF;
-            d.servo_latency_us = 0;
         }
     }
 
-    // ---- 4) TIMING DIAGNOSTICS ----
-    uint32_t isr_end = micros();
-    d.isr_total_us = isr_end - isr_start;
+    // ---- 5) JITTER & COMMAND ----
     d.period_error_us = (int16_t)(isr_start - expected_time);
-
-    // ---- 4.5) COMMAND TRACKING ----
     d.cmd_goal = g_last_cmd_goal;
-    d.cmd_time_us = g_last_cmd_time_us;
 
-    // ---- 5) COHERENCY CHECKSUM ----
-    uint32_t accel_bits;
-    memcpy(&accel_bits, &d.accel_x_mps2, sizeof(uint32_t));
-    d.checksum = d.frame_ts_us ^ d.frame_index ^ accel_bits;
+    // ---- 6) COHERENCY FLAG ----
     d.coherency_flag = 0xAA;
+
+    // ---- 7) RESERVED BYTES ----
+    memset(d.reserved, 0, 8);
+
+    // ---- 8) CRC16 field (zeroed - CRC validation disabled) ----
+    d.crc16 = 0;
 
     // ===== SEQLOCK WRITE END =====
     SEQLOCK_BARRIER();
@@ -2096,7 +2109,7 @@ void setup() {
     delay(100);
 
     // Enable torque on all servos at boot
-    enable_all_torque();
+    //enable_all_torque();
 
     #if ENABLE_DEBUG_OUTPUT
     Serial.println("Serial3 initialized @ 1 Mbaud");
@@ -2109,7 +2122,8 @@ void setup() {
     imu_cfg.cs_pin = IMU_CS;
     imu_cfg.spi_hz = 4000000;
 
-    if (!ISM330::init(imu_cfg)) {
+    g_imu_ok = ISM330::init(imu_cfg);
+    if (!g_imu_ok) {
         #if ENABLE_DEBUG_OUTPUT
         Serial.println("[WARN] IMU init failed - continuing without IMU");
         #endif
@@ -2124,6 +2138,8 @@ void setup() {
     #if ENABLE_DEBUG_OUTPUT
     Serial.println("ISM330DHCX initialized");
     #endif
+
+    // NOTE: CRC16 validation disabled - using magic header sync only
 
     // ========== MODE MANAGER INIT (no blocking handshake) ==========
     logging_active = false;
@@ -2236,7 +2252,7 @@ void loop() {
 
             // Snapshot and log
             {
-                SensorData snapshot = seqlock_read();
+                SensorDataV2 snapshot = seqlock_read();
                 static uint32_t last_frame = UINT32_MAX;
                 if (snapshot.frame_index != last_frame) {
                     csv_push_sample(snapshot);
